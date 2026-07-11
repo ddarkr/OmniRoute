@@ -379,6 +379,9 @@
       "sharp"
     ]
   },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
+  },
   "overrides": {
     "dompurify": "^3.4.12",
     "fast-xml-parser": "^5.10.1",
