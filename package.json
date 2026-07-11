@@ -371,6 +371,9 @@
       "sharp"
     ]
   },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
+  },
   "overrides": {
     "dompurify": "^3.4.11",
     "postcss": "^8.5.14",
