@@ -1,6 +1,7 @@
 import type { RegistryEntry } from "../../shared.ts";
 import {
   GPT_5_5_CODEX_CAPABILITIES,
+  GPT_5_6_CODEX_CAPABILITIES,
   getGitHubCopilotChatHeaders,
   resolvePublicCred,
 } from "../../shared.ts";
@@ -156,6 +157,27 @@ export const githubProvider: RegistryEntry = {
       targetFormat: "openai-responses",
       contextLength: 264000,
       maxOutputTokens: 64000,
+    },
+    // ── GPT-5.6 Codex family on GitHub Copilot (upstream codex models.json) ──
+    // No effort-suffix variants: GithubExecutor routes effort via the
+    // reasoning_effort body param, not -xhigh model-id suffixes (unlike codex).
+    {
+      id: "gpt-5.6-sol",
+      name: "GPT 5.6 Sol",
+      ...GPT_5_6_CODEX_CAPABILITIES,
+      targetFormat: "openai-responses",
+    },
+    {
+      id: "gpt-5.6-terra",
+      name: "GPT 5.6 Terra",
+      ...GPT_5_6_CODEX_CAPABILITIES,
+      targetFormat: "openai-responses",
+    },
+    {
+      id: "gpt-5.6-luna",
+      name: "GPT 5.6 Luna",
+      ...GPT_5_6_CODEX_CAPABILITIES,
+      targetFormat: "openai-responses",
     },
   ],
 };

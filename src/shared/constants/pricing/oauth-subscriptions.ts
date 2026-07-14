@@ -410,6 +410,18 @@ export const DEFAULT_PRICING_OAUTH = {
       reasoning: 48.0,
       cache_creation: 8.0,
     },
+    // GPT 5.6 Codex family on GitHub Copilot (gpt-5.6-sol / -terra / -luna).
+    // Real rates TBD at launch; placeholder mirrors the gpt-5.1-codex Copilot tier
+    // so usage/quota accounting stays non-zero until the official sheet lands.
+    "gpt-5.6-sol": { input: 4.0, output: 16.0, cached: 2.0, reasoning: 24.0, cache_creation: 4.0 },
+    "gpt-5.6-terra": {
+      input: 4.0,
+      output: 16.0,
+      cached: 2.0,
+      reasoning: 24.0,
+      cache_creation: 4.0,
+    },
+    "gpt-5.6-luna": { input: 4.0, output: 16.0, cached: 2.0, reasoning: 24.0, cache_creation: 4.0 },
     "gpt-4.1": {
       input: 2.5,
       output: 10.0,
