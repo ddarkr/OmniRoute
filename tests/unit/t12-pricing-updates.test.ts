@@ -51,6 +51,28 @@ test("T12: codex catalog includes GPT 5.5 variations", () => {
   assert.equal(codexModels.get("gpt-5.5-xhigh")?.targetFormat, "openai-responses");
 });
 
+test("T12: codex catalog includes GPT 5.6 variations", () => {
+  const codexModels = new Map(REGISTRY.codex.models.map((m) => [m.id, m]));
+  for (const id of [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol-xhigh",
+    "gpt-5.6-luna-low",
+  ]) {
+    assert.ok(codexModels.has(id), `missing codex/${id}`);
+    assert.equal(codexModels.get(id)?.targetFormat, "openai-responses");
+  }
+});
+
+test("T12: github catalog includes GPT 5.6 variations", () => {
+  const ghModels = new Map(REGISTRY.github.models.map((m) => [m.id, m]));
+  for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    assert.ok(ghModels.has(id), `missing github/${id}`);
+    assert.equal(ghModels.get(id)?.targetFormat, "openai-responses");
+  }
+});
+
 test("T12: pricing table includes MiniMax-M3 (canonical + lowercase alias)", () => {
   const pricing = getDefaultPricing();
 
