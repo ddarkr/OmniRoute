@@ -295,15 +295,21 @@ export const GPT_5_6_API_CAPABILITIES = {
   maxOutputTokens: 128000,
 } as const;
 
-// Codex's live catalog reports a 372K usable input budget for GPT-5.6.
-// Keep the reserved 128K output budget explicit, matching the GPT-5.5 catalog contract.
+// GPT-5.6 Codex context window: upstream codex models.json declares
+// context_window == max_context_window == 372000 for sol / terra / luna.
+// Rumored pre-launch figure was 1.5M, but — as with gpt-5.5 (Codex OAuth
+// backend caps at 400K vs the public-API 1.05M) — Codex tends to enforce a
+// tighter effective cap than the headline number. Codex's live catalog reports
+// a 372K usable input budget; keeping the conservative declared value here is
+// the single point of change if the limit moves at or after launch.
+export const GPT_5_6_CONTEXT_LENGTH = 372000;
 export const GPT_5_6_CODEX_CAPABILITIES = {
   targetFormat: "openai-responses",
   toolCalling: true,
   supportsReasoning: true,
   supportsVision: true,
   supportsXHighEffort: true,
-  contextLength: 500000,
+  contextLength: GPT_5_6_CONTEXT_LENGTH,
   maxInputTokens: 372000,
   maxOutputTokens: 128000,
 } as const;
