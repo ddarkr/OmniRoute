@@ -249,3 +249,5 @@ _artifacts/
 tests/homolog/.auth/
 tests/homolog/ui/.auth/
 homolog-report/
+# DX local workflow files
+.dx/
