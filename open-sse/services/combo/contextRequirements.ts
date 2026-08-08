@@ -117,18 +117,38 @@ export function applyContextRequirements(
   // Apply maxContextWindow filtering
   if (maxContextWindow && maxContextWindow > 0) {
     const beforeFilterCount = filtered.length;
+    const classified = filtered.map((target) => ({
+      target,
+      contextWindow: getTargetContextWindow(target),
+    }));
 
-    filtered = filtered.filter((target) => {
-      const contextWindow = getTargetContextWindow(target);
+    filtered = classified
+      .filter(({ contextWindow }) => {
+        // Unknown context limit handling
+        if (contextWindow === null) {
+          return contextFilterMode === "lenient";
+        }
 
-      // Unknown context limit handling
-      if (contextWindow === null) {
-        return contextFilterMode === "lenient";
+        // Known context limit - check threshold
+        return contextWindow <= maxContextWindow;
+      })
+      .map(({ target }) => target);
+
+    // maxContextWindow was added after the #8786 minimum-bound fix and must
+    // preserve the same unknown-only fail-open contract. Never resurrect a
+    // known-too-large target; restore only unknown-context candidates.
+    if (filtered.length === 0 && beforeFilterCount > 0 && contextFilterMode === "strict") {
+      const unknowns = classified
+        .filter(({ contextWindow }) => contextWindow === null)
+        .map(({ target }) => target);
+      if (unknowns.length > 0) {
+        log.warn(
+          "COMBO",
+          `Context requirements: strict mode would empty the pool (${beforeFilterCount} targets, none known <= ${maxContextWindow}); failing open to ${unknowns.length} unknown-context target(s)`
+        );
+        filtered = unknowns;
       }
-
-      // Known context limit - check threshold
-      return contextWindow <= maxContextWindow;
-    });
+    }
 
     if (filtered.length < beforeFilterCount) {
       log.info(

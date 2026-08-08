@@ -22,9 +22,8 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../../src/lib/db/core.ts");
 const { getModelContextLimit } = await import("../../../src/lib/modelCapabilities.ts");
-const { applyContextRequirements } = await import(
-  "../../../open-sse/services/combo/contextRequirements.ts"
-);
+const { applyContextRequirements } =
+  await import("../../../open-sse/services/combo/contextRequirements.ts");
 
 test.after(() => {
   core.resetDbInstance();
@@ -169,5 +168,55 @@ test("#8786: lenient mode still includes unknowns (unchanged)", () => {
     },
     noopLog
   );
+  assert.equal(result.length, 2);
+});
+
+test("strict maxContextWindow with ALL-unknown targets fails open instead of emptying the pool", () => {
+  const warnings: string[] = [];
+  const result = applyContextRequirements(
+    UNKNOWN_TARGETS.slice(0, 2),
+    {
+      maxContextWindow: 500000,
+      contextFilterMode: "strict",
+    },
+    {
+      ...noopLog,
+      warn(_tag: string, message: string) {
+        warnings.push(message);
+      },
+    }
+  );
+
+  assert.equal(result.length, 2);
+  assert.ok(warnings.some((message) => /failing open|unknown-context/i.test(message)));
+});
+
+test("strict maxContextWindow never resurrects a known-too-large target", () => {
+  const tooLarge = target("anthropic", "claude-sonnet-4-6");
+  assert.ok((getModelContextLimit(tooLarge.provider, tooLarge.modelStr) ?? 0) > 500000);
+
+  const result = applyContextRequirements(
+    [tooLarge],
+    {
+      maxContextWindow: 500000,
+      contextFilterMode: "strict",
+    },
+    noopLog
+  );
+
+  assert.equal(result.length, 0);
+});
+
+test("strict min+max bounds preserve unknown fail-open across both filters", () => {
+  const result = applyContextRequirements(
+    UNKNOWN_TARGETS.slice(0, 2),
+    {
+      minContextWindow: 32000,
+      maxContextWindow: 500000,
+      contextFilterMode: "strict",
+    },
+    noopLog
+  );
+
   assert.equal(result.length, 2);
 });
