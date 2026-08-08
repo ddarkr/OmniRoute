@@ -46,7 +46,7 @@
  * fail-open, so this never throws into the install.
  */
 
-import { cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -96,6 +96,20 @@ export function computeDependencyClosure(nodeModulesDir, seeds = SEED_PACKAGES) 
   return closure;
 }
 
+/** Return true when every source path is represented in the destination tree. */
+function hasCompleteTree(sourceDir, destinationDir) {
+  if (!existsSync(destinationDir)) return false;
+
+  for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
+    const sourcePath = join(sourceDir, entry.name);
+    const destinationPath = join(destinationDir, entry.name);
+    if (!existsSync(destinationPath)) return false;
+    if (entry.isDirectory() && !hasCompleteTree(sourcePath, destinationPath)) return false;
+  }
+
+  return true;
+}
+
 /**
  * Co-locate the SLM optional dependency closure from `<rootDir>/node_modules`
  * into a standalone bundle's `node_modules`.
@@ -104,9 +118,10 @@ export function computeDependencyClosure(nodeModulesDir, seeds = SEED_PACKAGES) 
  * postinstall path. Standalone builders, including Docker, may provide
  * `targetNodeModulesDir`.
  *
- * Packages already present in the destination are never overwritten. This
- * preserves the standalone bundle's pinned dependency instances while filling
- * dynamically imported packages that Next.js did not trace.
+ * Packages already present in the destination are merged without overwriting
+ * existing files. This preserves pinned standalone dependency instances while
+ * repairing hollow packages emitted by the Next.js tracer and filling dynamically
+ * imported packages that it omitted entirely.
  *
  * @param {{
  *   rootDir: string,
@@ -129,9 +144,7 @@ export function colocateLlmlinguaOptionals({
   if (!existsSync(targetNm)) {
     return {
       skipped: true,
-      reason: targetNodeModulesDir
-        ? "no target node_modules"
-        : "no standalone dist/node_modules",
+      reason: targetNodeModulesDir ? "no target node_modules" : "no standalone dist/node_modules",
     };
   }
 
@@ -142,11 +155,13 @@ export function colocateLlmlinguaOptionals({
 
   const closure = computeDependencyClosure(rootNm, seeds);
 
-  // Check the complete closure rather than only the entry package. A partially
-  // populated bundle must still receive any missing transitive dependencies.
+  // A package directory alone does not prove the standalone trace is complete:
+  // Next.js can emit a hollow package containing only package.json. Always walk
+  // the closure and merge missing payload files without overwriting traced files.
+
   if (
     closure.length > 0 &&
-    closure.every((name) => existsSync(join(targetNm, name)))
+    closure.every((name) => hasCompleteTree(join(rootNm, name), join(targetNm, name)))
   ) {
     return { skipped: true, reason: "already co-located" };
   }
@@ -155,16 +170,18 @@ export function colocateLlmlinguaOptionals({
 
   for (const name of closure) {
     const dest = join(targetNm, name);
-    if (existsSync(dest)) continue;
+    if (hasCompleteTree(join(rootNm, name), dest)) continue;
 
     try {
       mkdirSync(dirname(dest), { recursive: true });
-      cpSync(join(rootNm, name), dest, { recursive: true });
-      copied++;
+      cpSync(join(rootNm, name), dest, {
+        recursive: true,
+        force: false,
+        errorOnExist: false,
+      });
+      copied += 1;
     } catch (err) {
-      log(
-        `  ⚠️  LLMLingua optional co-location failed for ${name}: ${err.message}`
-      );
+      log(`  ⚠️  LLMLingua optional co-location failed for ${name}: ${err.message}`);
     }
   }
 

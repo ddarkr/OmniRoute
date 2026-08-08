@@ -125,6 +125,29 @@ test("colocateLlmlinguaOptionals copies the closure into dist and never clobbers
   }
 });
 
+test("colocateLlmlinguaOptionals repairs hollow traced packages without clobbering manifests", () => {
+  const root = mkdtempSync(join(tmpdir(), "omniroute-colocate-hollow-"));
+  try {
+    buildRoot(root);
+    const distNm = join(root, "dist", "node_modules");
+    mkPkg(distNm, "@huggingface/transformers", { version: "3.5.2" });
+    mkPkg(distNm, "@atjsh/llmlingua-2", { version: "1.0.0-traced" });
+
+    const result = colocateLlmlinguaOptionals({ rootDir: root });
+    assert.equal(result.skipped, false);
+    assert.ok(
+      existsSync(join(distNm, "@atjsh", "llmlingua-2", "dist", "index.js")),
+      "hollow package should receive its missing runtime payload"
+    );
+    const manifest = JSON.parse(
+      readFileSync(join(distNm, "@atjsh", "llmlingua-2", "package.json"), "utf8")
+    );
+    assert.equal(manifest.version, "1.0.0-traced", "traced manifest must not be overwritten");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("colocateLlmlinguaOptionals is idempotent (second run is a no-op)", () => {
   const root = mkdtempSync(join(tmpdir(), "omniroute-colocate-idem-"));
   try {
