@@ -255,6 +255,44 @@ test("runMigrations skips versions that are already tracked as applied", serial,
 });
 
 test(
+  "runMigrations records renumbered connection_runtime_state without rerunning old schema",
+  serial,
+  async () => {
+    const runner = await importFresh("src/lib/db/migrationRunner.ts");
+    const db = createDb();
+
+    try {
+      db.exec(`
+        CREATE TABLE connection_runtime_state (connection_id TEXT PRIMARY KEY);
+      `);
+
+      const appliedCount = withMockedMigrationFs(
+        {
+          "140_connection_runtime_state.sql":
+            "ALTER TABLE connection_runtime_state ADD COLUMN should_not_run TEXT;",
+        },
+        () => runner.runMigrations(db)
+      );
+
+      assert.equal(appliedCount, 1);
+      const columns = db.prepare("PRAGMA table_info(connection_runtime_state)").all() as Array<{
+        name: string;
+      }>;
+      assert.equal(
+        columns.some((column) => column.name === "should_not_run"),
+        false
+      );
+      assert.deepEqual(
+        db.prepare("SELECT version, name FROM _omniroute_migrations WHERE version = ?").get("140"),
+        { version: "140", name: "connection_runtime_state" }
+      );
+    } finally {
+      db.close();
+    }
+  }
+);
+
+test(
   "runMigrations applies api key lifecycle migration idempotently when columns already exist",
   serial,
   async () => {

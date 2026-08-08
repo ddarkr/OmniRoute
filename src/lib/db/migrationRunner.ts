@@ -465,6 +465,12 @@ function isSchemaAlreadyApplied(
       // exists the rebuild ran — skip re-executing the rename/copy/drop, which
       // would fail on the missing proxy_assignments_pre117 table.
       return hasColumn(db, "proxy_assignments", "position");
+    case "140":
+      // Retroactive guard for connection_runtime_state, renumbered from 135 after
+      // colliding with 135_migrate_model_capability_max_token on the fork merge.
+      // DBs that already ran the table migration under 135 must record 140 without
+      // re-executing the schema file.
+      return hasTable(db, "connection_runtime_state");
     // Retroactive guard for the 135/136 renumber (#8523 landed onto slots already taken
     // by #8908/#9515): a DB that ran these under the old numbers already has the column,
     // and a bare ALTER TABLE ADD COLUMN would throw on the re-run under the new number.

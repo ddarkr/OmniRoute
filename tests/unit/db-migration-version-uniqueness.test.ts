@@ -66,3 +66,14 @@ test("quota_pools lives at 085 (renumbered from the 077 collision)", () => {
   assert.ok(streamDefault, "api_key_stream_default_mode migration must exist");
   assert.equal(streamDefault.version, "077", "api_key_stream_default_mode stays at 077");
 });
+
+test("connection_runtime_state lives at 140 after the 135 collision", () => {
+  const files = migrationFiles();
+  const runtimeState = files.find((f) => f.name === "connection_runtime_state");
+  assert.ok(runtimeState, "connection_runtime_state migration must exist");
+  assert.equal(runtimeState.version, "140");
+
+  const modelTokenMigration = files.find((f) => f.name === "migrate_model_capability_max_token");
+  assert.ok(modelTokenMigration, "model capability token migration must exist");
+  assert.equal(modelTokenMigration.version, "135");
+});
