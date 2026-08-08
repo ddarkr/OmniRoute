@@ -19,8 +19,19 @@ import {
   isVisionBridgeForcedModel,
 } from "@/shared/constants/visionBridgeDefaults";
 import { getBestVisionModel } from "./visionBridgeRouter";
+import {
+  isProviderConnectionUsable,
+  hasUsableCredentialsForModel,
+} from "./visionBridgeCredentials";
+
+export { isProviderConnectionUsable, hasUsableCredentialsForModel };
 
 type ComboVisionBridgeDecision = "process" | "skip" | "not-combo";
+
+export function resolveVisionComboName(mapping: Record<string, unknown>): string | null {
+  const comboName = mapping.comboName ?? mapping.name ?? null;
+  return typeof comboName === "string" && comboName.length > 0 ? comboName : null;
+}
 
 /// Check if a combo model should trigger vision bridge processing.
 /// Resolves combo targets and returns:
@@ -39,7 +50,7 @@ async function getComboVisionBridgeDecision(model: string): Promise<ComboVisionB
     if (!combo) {
       const mapping = await resolveComboForModel(model);
       if (!mapping) return "not-combo";
-      const comboName = mapping.comboName ?? mapping.name ?? null;
+      const comboName = resolveVisionComboName(mapping);
       if (!comboName) return "not-combo";
       combo = await getComboByName(comboName);
     }
@@ -92,6 +103,11 @@ export interface VisionBridgeDependencies {
   ) => Promise<string>;
   /** Override combo-target vision check — return true to force processing, false to skip. */
   checkModelHasComboMapping?: (model: string) => Promise<boolean>;
+  /**
+   * Whether a model string has a usable active credential (true/false).
+   * Return `null` when indeterminate (no DB / error) so callers can fail-open.
+   */
+  hasUsableCredentials?: (model: string) => Promise<boolean | null>;
 }
 
 export class VisionBridgeGuardrail extends BaseGuardrail {
@@ -123,37 +139,48 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       return { block: false };
     }
 
-    // 3b. Auto/ prefix → skip guardrail (auto-combo resolver handles vision-capable model selection)
-    if (model === "auto" || model.startsWith("auto/")) {
-      return { block: false };
-    }
+    // 3b. Auto/ prefix — don't skip guardrail entirely. Images still need to be
+    // described or rerouted to a vision-capable model. The auto-combo resolver
+    // does NOT currently filter models by vision capability, so without the
+    // guardrail an image-bearing request assigned to a text-only model will
+    // fail upstream with "does not support images".
+    const isAuto = model === "auto" || model.startsWith("auto/");
 
-    const forceVisionBridge = isVisionBridgeForcedModel(model);
+    // Declare before the conditional so they're available to the rest of preCall
+    let forceVisionBridge = false;
+    let comboVisionBridgeDecision: ComboVisionBridgeDecision | undefined;
 
-    // 4. Check if model supports vision
-    const capabilities = getResolvedModelCapabilities(model);
-    const comboVisionBridgeDecision = forceVisionBridge
-      ? "process"
-      : this.deps.checkModelHasComboMapping
-        ? (await this.deps.checkModelHasComboMapping(model))
-          ? "process"
-          : "skip"
-        : await getComboVisionBridgeDecision(model);
+    if (!isAuto) {
+      forceVisionBridge = isVisionBridgeForcedModel(model);
 
-    if (comboVisionBridgeDecision === "skip") {
-      return { block: false };
-    }
+      // 4. Check if model supports vision
+      const capabilities = getResolvedModelCapabilities(model);
+      comboVisionBridgeDecision = forceVisionBridge
+        ? "process"
+        : this.deps.checkModelHasComboMapping
+          ? (await this.deps.checkModelHasComboMapping(model))
+            ? "process"
+            : "skip"
+          : await getComboVisionBridgeDecision(model);
 
-    if (capabilities.supportsVision === true && !forceVisionBridge) {
-      // The request model supports vision natively, but check if a
-      // model-combo mapping routes this model through a combo where
-      // some targets may NOT support vision. In that case, the vision
-      // bridge must process images so combo targets can describe them.
-      if (comboVisionBridgeDecision !== "process") {
+      if (comboVisionBridgeDecision === "skip") {
         return { block: false };
       }
-      // Combo mapping found — fall through to process images
+
+      if (capabilities?.supportsVision === true && !forceVisionBridge) {
+        // The request model supports vision natively, but check if a
+        // model-combo mapping routes this model through a combo where
+        // some targets may NOT support vision. In that case, the vision
+        // bridge must process images so combo targets can describe them.
+        if (comboVisionBridgeDecision !== "process") {
+          return { block: false };
+        }
+        // Combo mapping found — fall through to process images
+      }
     }
+    // For auto models (isAuto=true), force remains false and combo decision
+    // remains undefined, which makes the reroute check on line ~189 treat it
+    // like a non-combo model — exactly what we want: reroute to a vision model.
 
     // 5. Get body and check for messages
     const body = payload as Record<string, unknown>;
@@ -183,37 +210,78 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       return { block: false };
     }
 
-    // 9. Individual non-combo model with images → REROUTE to best vision-capable model
+    // 9. Individual non-combo model with images → optionally REROUTE to best vision-capable model
     // instead of describing images through an intermediate vision call.
-    // This lets a downstream vision model process the image natively.
-    if (comboVisionBridgeDecision === "not-combo" && !forceVisionBridge) {
-      // Honor an explicit operator override from the Vision Bridge settings tab
-      // (settings.visionBridgeModel) as the fixed reroute target, for consistency
-      // with the combo/describe path below (step 10) which always honors it via
-      // getVisionBridgeConfig. When unset, auto-select the fastest available
-      // vision-capable model from available providers.
-      const configuredModel =
-        typeof settings.visionBridgeModel === "string" && settings.visionBridgeModel.trim()
-          ? settings.visionBridgeModel.trim()
-          : undefined;
-      const bestModel = getBestVisionModel({ fixedModel: configuredModel });
-      if (bestModel && bestModel !== model) {
-        const modifiedBody = {
-          ...(body as Record<string, unknown>),
-          model: bestModel,
-        };
-        return {
-          block: false,
-          modifiedPayload: modifiedBody as unknown,
-          meta: {
-            rerouted: true,
-            fromModel: model,
-            toModel: bestModel,
-            imagesKept: imageParts.length,
-          },
-        };
+    //
+    // CRITICAL (VibeProxy combo / explicit provider models):
+    // When the original model already has usable credentials (e.g. combo target
+    // zai/glm-5.2), NEVER whole-request-reroute to another provider. Auto-select
+    // prefers opencode-* (priority 0) even when only a broken noauth connection
+    // exists, which produced: HTTP log zai → Guardrail reroute → opencode-zen 401
+    // "Missing API key" while the combo UI still showed body=zai. Fall through to
+    // the image-describe path so the user's chosen model still answers.
+    //
+    // Reroute also fires for the auto/ prefix (isAuto): the auto-combo resolver
+    // does not filter candidates for vision capability, so an image-bearing
+    // request with model=auto would land on a text-only model (#7871). Keeping
+    // "auto" is never the answer there, so the keep-credentialed-model skip
+    // below does not apply to auto — only the reroute-target credential guard.
+    if ((comboVisionBridgeDecision === "not-combo" || isAuto) && !forceVisionBridge) {
+      const checkCreds = this.deps.hasUsableCredentials ?? hasUsableCredentialsForModel;
+      const originalUsable = await checkCreds(model);
+
+      if (originalUsable === true && !isAuto) {
+        // Keep the credentialed model; describe images below if needed.
+        context.log?.debug?.(
+          "VISION_BRIDGE",
+          `Skipping whole-request vision reroute; keeping credentialed model ${model}`
+        );
+      } else {
+        // Honor an explicit operator override from the Vision Bridge settings tab
+        // (settings.visionBridgeModel) as the fixed reroute target, for consistency
+        // with the combo/describe path below (step 10) which always honors it via
+        // getVisionBridgeConfig. When unset, auto-select the fastest available
+        // vision-capable model from available providers.
+        const configuredModel =
+          typeof settings.visionBridgeModel === "string" && settings.visionBridgeModel.trim()
+            ? settings.visionBridgeModel.trim()
+            : undefined;
+        // Propagate the same resolved credential check used by the adjacent
+        // checkCreds() calls above/below (#8430) — without this, the router
+        // falls back to the real DB-backed hasUsableCredentialsForModel and
+        // ignores an injected `deps.hasUsableCredentials` test/DI override.
+        const bestModel = await getBestVisionModel(
+          { fixedModel: configuredModel },
+          { hasUsableCredentials: checkCreds }
+        );
+        if (bestModel && bestModel !== model) {
+          const bestUsable = await checkCreds(bestModel);
+          // Only block the reroute when we KNOW the target is unusable (false).
+          // `null` (no DB / tests) fails open so existing unit tests keep working.
+          if (bestUsable === false) {
+            context.log?.warn?.(
+              "VISION_BRIDGE",
+              `Vision reroute target ${bestModel} has no usable credentials; describing images instead of hijacking ${model}`
+            );
+          } else {
+            const modifiedBody = {
+              ...(body as Record<string, unknown>),
+              model: bestModel,
+            };
+            return {
+              block: false,
+              modifiedPayload: modifiedBody as unknown,
+              meta: {
+                rerouted: true,
+                fromModel: model,
+                toModel: bestModel,
+                imagesKept: imageParts.length,
+              },
+            };
+          }
+        }
       }
-      // Fall through: if no vision model found, describe images as text instead
+      // Fall through: describe images as text (or no-op if describe path can't run)
     }
 
     // 10. Get configuration
@@ -254,6 +322,19 @@ export class VisionBridgeGuardrail extends BaseGuardrail {
       logger?.warn?.("VISION-BRIDGE", `Failed to get description for image ${i + 1}: ${message}`);
       return null;
     });
+
+    // 12b. (#8430) When every describe call failed (all null descriptions) in
+    // the combo describe path, the upstream is a confirmed non-vision model that
+    // cannot process raw images — replacing them with an "(unavailable)" stub
+    // is safe here because the upstream can only handle text. The original #4012
+    // preserve-raw behavior only applies to paths where the upstream might still
+    // be vision-capable (reroute path / unknown capability).
+    const allNull = descriptions.every((d) => d === null);
+    if (allNull && comboVisionBridgeDecision === "process") {
+      for (let i = 0; i < descriptions.length; i++) {
+        descriptions[i] = `[Image ${i + 1}]: (unavailable — no vision-capable provider connected)`;
+      }
+    }
 
     // 13. Replace image parts with text descriptions (null → keep original image)
     const modifiedBody = replaceImageParts(

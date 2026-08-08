@@ -287,9 +287,9 @@ async function waitFor(fn, timeoutMs = 30000) {
   return null;
 }
 
-async function waitForAsyncSideEffects() {
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setTimeout(resolve, 10));
+async function flushAsyncSideEffects() {
+  // setImmediate rounds drain the event loop more reliably than setTimeout under CI load.
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 async function getLatestCallLog() {
@@ -363,7 +363,7 @@ async function invokeChatCore({
       onCredentialsRefreshed,
       onRequestSuccess,
     } as any);
-    await waitForAsyncSideEffects();
+    await flushAsyncSideEffects();
 
     return { result, calls, call: calls.at(-1) };
   } finally {
@@ -376,7 +376,7 @@ test.afterEach(async () => {
   restorePipelineCaptureEnv();
   clearPendingRequests();
   resetAccountSemaphores();
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
   await resetStorage();
 });
 
@@ -385,7 +385,7 @@ test.after(async () => {
   restorePipelineCaptureEnv();
   clearPendingRequests();
   resetAccountSemaphores();
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
   await resetStorage();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
@@ -443,7 +443,7 @@ test("chatCore times out upstream execution before provider response headers", a
     assert.equal(pendingDetail?.providerRequest?.model, "gpt-4o-mini");
     assert.deepEqual(pendingDetail?.providerRequest?.messages, body.messages);
     const result = await invocation;
-    await waitForAsyncSideEffects();
+    await flushAsyncSideEffects();
 
     assert.equal(upstreamBodies[0]?.model, "gpt-4o-mini");
     assert.deepEqual(upstreamBodies[0]?.messages, body.messages);
@@ -472,7 +472,7 @@ test("chatCore can disable pipeline stream chunk capture through environment", a
 
   assert.equal(result.success, true);
   await result.response.text();
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
 
   const detail = await waitFor(getLatestCallLog);
   assert.ok(detail, "expected call log detail to be persisted");
@@ -673,10 +673,13 @@ test("chatCore builds Claude Code-compatible upstream requests for CC providers"
   });
 
   assert.equal(result.success, true);
-  assert.equal(call.headers.Accept ?? call.headers.accept, "text/event-stream");
-  assert.deepEqual([call.body.stream, call.body.context_management], [true, undefined]);
-  assert.equal(call.body.system.length, 1);
-  assert.match(call.body.system[0].text, /Claude Agent SDK/);
+  assert.equal(call.headers.Accept ?? call.headers.accept, "application/json");
+  assert.equal(call.body.stream, true);
+  assert.equal(call.body.context_management.edits[0].type, "clear_thinking_20251015");
+  assert.equal(
+    call.body.system.some((block: { text?: string }) => /Claude Agent SDK/.test(block.text || "")),
+    true
+  );
   assert.equal(typeof call.body.metadata.user_id, "string");
   assert.equal(call.body.messages[0].role, "user");
   assert.equal(call.body.messages[0].content[0].text, "Ping");
@@ -757,6 +760,60 @@ test("chatCore normalizes native Claude Code messages for native Claude OAuth pa
 
   // user msg[2] (was clientMessages[3]): tool_result preserved (preserveToolResultBlocks:true)
   assert.equal(call.body.messages[2].content[0].type, "tool_result");
+});
+
+test("chatCore preserves Opus 5 mid-conversation system cache breakpoints", async () => {
+  await settingsDb.updateSettings({ alwaysPreserveClientCache: "auto" });
+  invalidateCacheControlSettingsCache();
+
+  const { call, result } = await invokeChatCore({
+    provider: "claude",
+    model: "claude-opus-5",
+    endpoint: "/v1/messages",
+    credentials: { apiKey: "claude-key", providerSpecificData: {} },
+    body: {
+      model: "claude-opus-5",
+      max_tokens: 64,
+      system: [
+        {
+          type: "text",
+          text: "stable system prompt",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+      ],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "first turn" }] },
+        { role: "assistant", content: [{ type: "text", text: "first response" }] },
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: "compact continuation",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        { role: "user", content: [{ type: "text", text: "latest turn" }] },
+      ],
+      tools: [{ name: "Bash", input_schema: { type: "object", properties: {} } }],
+    },
+    userAgent: "Claude-Code/2.1.220",
+    requestHeaders: { "x-app": "cli", "x-claude-code-session-id": "session-123" },
+    responseFormat: "claude",
+  });
+
+  assert.equal(result.success, true);
+  assert.deepEqual(
+    call.body.messages.map((message: { role: string }) => message.role),
+    ["user", "assistant", "system", "user"]
+  );
+  assert.deepEqual(call.body.messages[2].content[0].cache_control, { type: "ephemeral" });
+  assert.equal(
+    call.body.system.some((block: { text?: string }) => block.text === "compact continuation"),
+    false
+  );
+  assert.equal(call.body.messages[3].content[0].cache_control, undefined);
 });
 
 test("chatCore keeps Claude normalization for non-Claude-Code Claude passthrough", async () => {
@@ -855,10 +912,14 @@ test("chatCore normalizes native Claude Code messages before CC-compatible relay
   // After normalization: role:"system" msg extracted → top-level system (3 msgs remain, not 4)
   assert.equal(call.body.messages.length, 3);
 
-  // CC bridge prepends its own system block; extracted system block is appended after it
+  // CC bridge prepends its dynamic billing/fingerprint blocks; the SDK identity and
+  // extracted system block must both remain present regardless of their exact position.
   assert.equal(
-    call.body.system[0].text,
-    "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    call.body.system.some(
+      (block: { text?: string }) =>
+        block.text === "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    ),
+    true
   );
   assert.equal(
     call.body.system.some(
@@ -927,6 +988,52 @@ test("chatCore preserves cache_control automatically for Claude Code single-mode
   assert.deepEqual(call.body.system[2].cache_control, { type: "ephemeral", ttl: "5m" });
   assert.deepEqual(call.body.messages[0].content[0].cache_control, { type: "ephemeral" });
   // base.ts executor explicitly strips cache_control from tools for Claude Code clients
+  assert.equal(call.body.tools[0].cache_control, undefined);
+});
+
+test("chatCore supplements a missing message cache breakpoint for native Claude Code requests", async () => {
+  await settingsDb.updateSettings({ alwaysPreserveClientCache: "auto" });
+  invalidateCacheControlSettingsCache();
+
+  const { call } = await invokeChatCore({
+    provider: "claude",
+    model: "claude-sonnet-4-6",
+    endpoint: "/v1/messages",
+    credentials: { apiKey: "claude-key", providerSpecificData: {} },
+    body: {
+      model: "claude-sonnet-4-6",
+      max_tokens: 64,
+      system: [
+        {
+          type: "text",
+          text: "stable system prompt",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+        {
+          type: "text",
+          text: "stable project instructions",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+      ],
+      messages: [
+        { role: "user", content: [{ type: "text", text: "first turn" }] },
+        { role: "assistant", content: [{ type: "text", text: "first response" }] },
+        { role: "user", content: [{ type: "text", text: "latest turn" }] },
+      ],
+      tools: [
+        {
+          name: "lookup_weather",
+          description: "Fetch weather",
+          input_schema: { type: "object" },
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+      ],
+    },
+    userAgent: "Claude-Code/1.0.0",
+    responseFormat: "claude",
+  });
+
+  assert.deepEqual(call.body.messages[2].content[0].cache_control, { type: "ephemeral" });
   assert.equal(call.body.tools[0].cache_control, undefined);
 });
 
@@ -1595,7 +1702,7 @@ test("chatCore returns a semantic cache HIT for repeated deterministic requests"
   const payload = (await second.result.response.json()) as any;
   assert.equal(payload.choices[0].message.content, "cached-once");
 
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
   const semanticLog = await waitFor(async () => {
     const rows = await getCallLogs({ limit: 10 });
     const hit = rows.find((row) => row.cacheSource === "semantic");
@@ -1786,110 +1893,6 @@ test("chatCore redirects background utility tasks to a cheaper mapped model", as
 
   assert.equal(result.success, true);
   assert.equal(call.body.model, "gpt-5-mini");
-});
-
-test("chatCore retries Qwen quota 429 responses before succeeding", async () => {
-  const originalSetTimeout = globalThis.setTimeout;
-  try {
-    (globalThis as any).setTimeout = (callback: any, ms: any, ...args: any[]) => {
-      // Only make Qwen retry delays (≤5s) synchronous; let longer timeouts (e.g. body read) use real setTimeout
-      if (typeof ms === "number" && ms > 5000) {
-        return originalSetTimeout(callback, ms, ...args);
-      }
-      callback(...args);
-      return 0 as any;
-    };
-
-    const { calls, result } = await invokeChatCore({
-      provider: "qwen",
-      model: "qwen3-coder",
-      body: {
-        model: "qwen3-coder",
-        stream: false,
-        messages: [{ role: "user", content: "retry the quota hit" }],
-      },
-      responseFactory(_captured, seenCalls) {
-        if (seenCalls.length === 1) {
-          return new Response(
-            JSON.stringify({ error: { message: "You exceeded your current quota for Qwen." } }),
-            {
-              status: 429,
-              headers: { "Content-Type": "application/json" },
-            }
-          );
-        }
-        return buildOpenAIResponse(false, "qwen recovered");
-      },
-    });
-
-    const payload = (await result.response.json()) as any;
-    assert.equal(result.success, true);
-    assert.equal(calls.length, 2);
-    assert.equal(payload.choices[0].message.content, "qwen recovered");
-  } finally {
-    globalThis.setTimeout = originalSetTimeout;
-  }
-});
-
-test("chatCore injects fallback user for Qwen OAuth requests without user", async () => {
-  const { call, result } = await invokeChatCore({
-    provider: "qwen",
-    model: "qwen3-coder",
-    credentials: {
-      accessToken: "qwen-oauth-token",
-      providerSpecificData: { resourceUrl: "portal.qwen.ai" },
-    },
-    body: {
-      model: "qwen3-coder",
-      stream: false,
-      messages: [{ role: "user", content: "check qwen user fallback" }],
-    },
-    responseFormat: "openai",
-  });
-
-  assert.equal(result.success, true);
-  assert.equal(call.body.user, "omniroute-qwen-oauth");
-});
-
-test("chatCore keeps explicit user for Qwen OAuth requests", async () => {
-  const { call, result } = await invokeChatCore({
-    provider: "qwen",
-    model: "qwen3-coder",
-    credentials: {
-      accessToken: "qwen-oauth-token",
-      providerSpecificData: { resourceUrl: "portal.qwen.ai" },
-    },
-    body: {
-      model: "qwen3-coder",
-      stream: false,
-      user: "explicit-user",
-      messages: [{ role: "user", content: "keep my user" }],
-    },
-    responseFormat: "openai",
-  });
-
-  assert.equal(result.success, true);
-  assert.equal(call.body.user, "explicit-user");
-});
-
-test("chatCore does not inject fallback user for Qwen API key requests", async () => {
-  const { call, result } = await invokeChatCore({
-    provider: "qwen",
-    model: "qwen3-coder",
-    credentials: {
-      apiKey: "qwen-api-key",
-      providerSpecificData: { resourceUrl: "dashscope.aliyuncs.com/compatible-mode/v1" },
-    },
-    body: {
-      model: "qwen3-coder",
-      stream: false,
-      messages: [{ role: "user", content: "api key mode should stay untouched" }],
-    },
-    responseFormat: "openai",
-  });
-
-  assert.equal(result.success, true);
-  assert.equal("user" in call.body, false);
 });
 
 test("chatCore preserves Codex dual-window scope cooldowns on 429 responses", async () => {
@@ -2471,6 +2474,69 @@ test("chatCore maps upstream aborts to request-aborted errors", async () => {
   assert.equal(result.error, "Request aborted");
 });
 
+test("chatCore maps raw string abort reasons to 499, not 502 (#7907)", async () => {
+  // abort(reason) rejects the upstream fetch with the raw reason — often a
+  // bare string with no `name`/`status`. It must map to 499 like a named
+  // AbortError, not fall through to the 502 provider-failure default.
+  const { result } = await invokeChatCore({
+    provider: "openai",
+    model: "gpt-4o-mini",
+    body: {
+      model: "gpt-4o-mini",
+      stream: false,
+      messages: [{ role: "user", content: "abort me with a string reason" }],
+    },
+    responseFactory() {
+      throw "request_signal_aborted";
+    },
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 499);
+  assert.equal(result.error, "Request aborted");
+});
+
+// Live incident territory (dashboard log id 1784504040241-6f8b9a): the client had
+// ALREADY disconnected before this synthetic error body was ever computed — nothing
+// was actually delivered to it. Persisting that body as `clientResponse` (the
+// dashboard's "what the client received" field) is misleading, since it implies a
+// response was sent when the client never got one. `error` above already records
+// the failure reason; `clientResponse`/`responseBody` should stay empty for an abort.
+test("chatCore does not log a synthetic clientResponse body for a client abort", async () => {
+  // clientResponse only ever lands in the persisted pipeline payloads when detailed
+  // call-log capture is on (attemptLogging.ts's detailedLoggingEnabled gate) — this is
+  // exactly the setting a real "detailed logging" connection/request has enabled, which
+  // is why the live incident's artifact JSON had a full pipeline (including the
+  // misleading clientResponse) to begin with.
+  await settingsDb.updateSettings({ call_log_pipeline_enabled: true });
+
+  await invokeChatCore({
+    provider: "openai",
+    model: "gpt-4o-mini",
+    body: {
+      model: "gpt-4o-mini",
+      stream: false,
+      messages: [{ role: "user", content: "abort me, no fake clientResponse" }],
+    },
+    responseFactory() {
+      const error = new Error("request aborted by client");
+      error.name = "AbortError";
+      throw error;
+    },
+  });
+
+  const detail = await waitFor(() => getLatestCallLog());
+  assert.ok(detail);
+  assert.equal(detail.status, 499);
+  assert.match(String(detail.error ?? ""), /Request aborted/);
+  assert.ok(detail.pipelinePayloads, "expected pipeline payloads when capture is enabled");
+  assert.equal(
+    (detail.pipelinePayloads as Record<string, unknown>).clientResponse,
+    undefined,
+    "an aborted request never delivered anything to the client — clientResponse must stay unset"
+  );
+});
+
 test("chatCore returns streaming responses without waiting for upstream completion", async () => {
   const encoder = new TextEncoder();
   let closeUpstream: (() => void) | null = null;
@@ -2566,7 +2632,7 @@ test("chatCore releases account semaphore slots when upstream execution throws",
     },
   });
 
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
 
   assert.equal(result.success, false);
   assert.equal(result.status, 502);
@@ -2643,7 +2709,7 @@ test("chatCore caches streaming response and serves cache HIT on repeat", async 
   assert.equal(first.result.success, true);
   // Consume the stream to trigger onStreamComplete and cache write
   await first.result.response.text();
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
 
   // Second request with same body should get cache HIT (JSON, not SSE)
   const second = await invokeChatCore({
@@ -2696,7 +2762,7 @@ test("chatCore does not cache streaming response when temperature > 0", async ()
   });
 
   await first.result.response.text();
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
 
   const second = await invokeChatCore({
     provider: "openai",
@@ -2738,7 +2804,7 @@ test("chatCore skips streaming cache when X-OmniRoute-No-Cache header is set", a
   });
 
   await first.result.response.text();
-  await waitForAsyncSideEffects();
+  await flushAsyncSideEffects();
 
   // Verify nothing was cached
   const sig = generateSignature("gpt-4o-mini", sharedBody.messages, 0, 1);

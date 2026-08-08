@@ -6,6 +6,7 @@ import { appendRequestLog } from "@/lib/usageDb";
 import {
   getLoggedInputTokens,
   getLoggedOutputTokens,
+  getNoCacheTokens,
   getPromptCacheCreationTokens,
   getPromptCacheReadTokens,
 } from "@/lib/usage/tokenAccounting";
@@ -113,12 +114,28 @@ function getTimeString() {
 }
 
 /**
- * Add buffer tokens to usage to prevent context errors
+ * Compute the context-window safety margin for a usage object, WITHOUT touching the
+ * client-visible/metering fields (prompt_tokens/input_tokens/total_tokens).
+ *
+ * #8331: the buffer used to be added directly into those fields, so a real 69-token
+ * request was reported to the client as 2069 while call_logs/the raw upstream body kept
+ * the true 69 — a metering/billing discrepancy. The safety margin this function computes
+ * is intentionally scoped to context-fit/CLI-headroom use only (see module docstring
+ * above); it is surfaced here as separate `context_budget_*` fields so it never gets
+ * confused with reported token accounting again. `filterUsageForFormat()` does not
+ * allow-list these fields, so they are stripped before any response reaches a client.
  * @param {object} usage - Usage object (supported format)
- * @returns {object} Usage with buffer added
+ * @returns {object} Usage with context_budget_* fields added (metering fields unchanged)
  */
 export function addBufferToUsage(usage) {
   if (!usage || typeof usage !== "object") return usage;
+
+  // Heuristic estimates (web/cookie providers with no upstream metering) should
+  // not get the safety buffer — otherwise a 6-token "hi"/"PONG" becomes a flat
+  // ~2000 for every request and looks like fake metering.
+  if ((usage as { estimated?: unknown }).estimated === true) {
+    return usage;
+  }
 
   const buffer = getBufferTokens();
   if (buffer === 0) return usage;
@@ -127,20 +144,21 @@ export function addBufferToUsage(usage) {
 
   // Claude format
   if (result.input_tokens !== undefined) {
-    result.input_tokens += buffer;
+    result.context_budget_input_tokens = result.input_tokens + buffer;
   }
 
   // OpenAI format
   if (result.prompt_tokens !== undefined) {
-    result.prompt_tokens += buffer;
+    result.context_budget_prompt_tokens = result.prompt_tokens + buffer;
   }
 
-  // Calculate or update total_tokens
+  // Calculate or update the context-budget total
   if (result.total_tokens !== undefined) {
-    result.total_tokens += buffer;
+    result.context_budget_total_tokens = result.total_tokens + buffer;
   } else if (result.prompt_tokens !== undefined && result.completion_tokens !== undefined) {
-    // Calculate total_tokens if not exists
+    // Calculate total_tokens if not exists (real value — not buffered)
     result.total_tokens = result.prompt_tokens + result.completion_tokens;
+    result.context_budget_total_tokens = result.total_tokens + buffer;
   }
 
   return result;
@@ -200,6 +218,7 @@ export function filterUsageForFormat(usage, targetFormat) {
     [FORMATS.CLAUDE]: [
       "input_tokens",
       "output_tokens",
+      "output_tokens_details",
       "cache_read_input_tokens",
       "cache_creation_input_tokens",
       "estimated",
@@ -215,9 +234,13 @@ export function filterUsageForFormat(usage, targetFormat) {
     [FORMATS.OPENAI_RESPONSES]: [
       "input_tokens",
       "output_tokens",
+      "total_tokens",
       "input_tokens_details",
       "output_tokens_details",
       "estimated",
+      "cost_in_usd_ticks",
+      "server_side_tool_usage_details",
+      "server_side_tool_usage",
     ],
     // OpenAI format (default for OPENAI, CODEX, KIRO, etc.)
     default: [
@@ -268,6 +291,7 @@ export function normalizeUsage(usage) {
   assignNumber("cache_read_input_tokens", usage?.cache_read_input_tokens);
   assignNumber("cache_creation_input_tokens", usage?.cache_creation_input_tokens);
   assignNumber("cached_tokens", usage?.cached_tokens);
+  assignNumber("no_cache_tokens", usage?.no_cache_tokens);
   assignNumber("reasoning_tokens", usage?.reasoning_tokens);
   // xAI's exact provider-reported cost (port of decolua/9router#2453, capability A —
   // @ryanngit). Ticks → USD conversion happens in costCalculator.ts, not here.
@@ -354,6 +378,7 @@ export function extractUsage(chunk) {
       output_tokens: chunk.usage.output_tokens || 0,
       cache_read_input_tokens: chunk.usage.cache_read_input_tokens,
       cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens,
+      reasoning_tokens: chunk.usage.output_tokens_details?.thinking_tokens,
     });
   }
 
@@ -393,6 +418,9 @@ export function extractUsage(chunk) {
         chunk.usage.input_tokens_details?.cached_tokens ??
         chunk.usage.prompt_cache_hit_tokens ??
         chunk.usage.cached_tokens,
+      cache_read_input_tokens: chunk.usage.cache_read_input_tokens,
+      cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens,
+      no_cache_tokens: chunk.usage.no_cache_tokens,
       reasoning_tokens:
         chunk.usage.completion_tokens_details?.reasoning_tokens ??
         chunk.usage.output_tokens_details?.reasoning_tokens ??
@@ -408,12 +436,15 @@ export function extractUsage(chunk) {
   // chunks do not silently drop token usage.
   const usageMeta = chunk.usageMetadata || chunk.response?.usageMetadata;
   if (usageMeta && typeof usageMeta === "object") {
+    // Gemini reports thoughts outside candidates. Fold them into completion so
+    // every provider keeps reasoning as a subset of completion tokens.
+    const thoughts = usageMeta.thoughtsTokenCount || 0;
     return normalizeUsage({
       prompt_tokens: usageMeta.promptTokenCount || 0,
-      completion_tokens: usageMeta.candidatesTokenCount || 0,
+      completion_tokens: (usageMeta.candidatesTokenCount || 0) + thoughts,
       total_tokens: usageMeta.totalTokenCount,
       cached_tokens: usageMeta.cachedContentTokenCount,
-      reasoning_tokens: usageMeta.thoughtsTokenCount,
+      reasoning_tokens: thoughts,
     });
   }
 
@@ -582,6 +613,11 @@ export function logUsage(
 
   const cacheCreation = getPromptCacheCreationTokens(usage);
   if (cacheCreation) msg += ` | cache_create=${cacheCreation}`;
+
+  // Non-cached (fresh) input tokens — informational only, already included in
+  // prompt_tokens (Command Code reports inputTokenDetails.noCacheTokens).
+  const noCache = getNoCacheTokens(usage);
+  if (noCache) msg += ` | no_cache=${noCache}`;
 
   const reasoning = usage.reasoning_tokens;
   if (reasoning) msg += ` | reasoning=${reasoning}`;

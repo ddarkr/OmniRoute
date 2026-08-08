@@ -13,7 +13,17 @@ export const RESET_WINDOW_NAMES = ["weekly", "session", "monthly"] as const;
 export type ComboRetryAfter = string | number | Date;
 
 export type ComboErrorBody = {
-  error?: { code?: string | null; message?: string | null } | string;
+  error?:
+    | {
+        code?: string | null;
+        message?: string | null;
+        // buildModelCooldownBody (open-sse/utils/error.ts) nests its retry hint
+        // here instead of at the top level — see the retryAfter fallback in
+        // combo.ts's dispatchWithCooldownRetry error extraction.
+        retry_after?: string | null;
+        reset_seconds?: number | null;
+      }
+    | string;
   message?: string | null;
   retryAfter?: ComboRetryAfter | null;
 } | null;
@@ -85,6 +95,8 @@ export type ComboNestingContext = {
   attemptBudget: { count: number; limit: number };
 };
 
+export type HiddenModelsByProvider = ReadonlyMap<string, ReadonlySet<string>>;
+
 export type HandleComboChatOptions = {
   body: Record<string, unknown>;
   combo: ComboLike;
@@ -97,6 +109,7 @@ export type HandleComboChatOptions = {
   signal?: AbortSignal | null;
   apiKeyAllowedConnections?: string[] | null;
   nesting?: ComboNestingContext | null;
+  hiddenModelsByProvider?: HiddenModelsByProvider;
 };
 
 export type HandleRoundRobinOptions = Omit<
@@ -109,6 +122,12 @@ export type HistoricalLatencyStatsEntry = {
   p95LatencyMs?: number;
   latencyStdDev?: number;
   successRate?: number;
+  /** Mean time-to-first-token (ms) from getModelLatencyStats() (#6875). */
+  avgTtftMs?: number;
+  /** Mean end-to-end request latency (ms) from getModelLatencyStats() (#6875). */
+  avgE2ELatencyMs?: number;
+  /** Mean output tokens/sec from getModelLatencyStats() (#6875). */
+  avgTokensPerSecond?: number;
 };
 
 export type AutoProviderCandidate = ProviderCandidate & {
@@ -151,6 +170,7 @@ export type ResolvedComboTarget = {
   allowedConnectionIds?: string[] | null;
   weight: number;
   label: string | null;
+  prompt?: string | null;
   failoverBeforeRetry?: unknown;
   trafficType?: "production" | "shadow";
   /**

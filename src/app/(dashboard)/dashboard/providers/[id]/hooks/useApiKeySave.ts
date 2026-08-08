@@ -12,6 +12,7 @@
 
 import { useCallback } from "react";
 import type React from "react";
+import { providerUsesCuratedModelsOnly } from "@/lib/providers/modelListingCapability";
 import type { ProviderMessageTranslator } from "../providerPageHelpers";
 import type { ImportProgress } from "./useModelImportHandlers";
 
@@ -23,7 +24,11 @@ type UseApiKeySaveParams = {
   setShowImportModal: (open: boolean) => void;
   setShowAddApiKeyModal: (open: boolean) => void;
   setSiliconFlowInitialBaseUrl: (url: string | undefined) => void;
-  notify: { success: (msg: string) => void; error: (msg: string) => void; info?: (msg: string) => void };
+  notify: {
+    success: (msg: string) => void;
+    error: (msg: string) => void;
+    info?: (msg: string) => void;
+  };
   t: ProviderMessageTranslator;
 };
 
@@ -52,9 +57,9 @@ export function useApiKeySave({
           setShowAddApiKeyModal(false);
           setSiliconFlowInitialBaseUrl(undefined);
 
-          // Universal: sync models from the provider endpoint on every new connection
-          // (was previously Gemini-only). Do NOT re-introduce a providerId guard here.
-          if (newConnection?.id) {
+          // Most providers sync their live catalog after connection creation. Curated-only
+          // providers intentionally use the registry list and must not show an import flow.
+          if (newConnection?.id && !providerUsesCuratedModelsOnly(providerId)) {
             setShowImportModal(true);
             setImportProgress({
               current: 0,
@@ -136,11 +141,17 @@ export function useApiKeySave({
           }
           return null;
         }
+        // Even if the server returned an error, the connection may have been
+        // persisted (e.g. post-commit housekeeping failed after the DB write).
+        // Refresh the list so the UI picks it up on next render.
+        void fetchConnections();
         const data = await res.json().catch(() => ({}));
         const errorMsg = data.error?.message || data.error || t("failedSaveConnection");
         return errorMsg;
       } catch (error) {
         console.log("Error saving connection:", error);
+        // The connection may still have been persisted despite the network error.
+        void fetchConnections();
         return t("failedSaveConnectionRetry");
       }
     },

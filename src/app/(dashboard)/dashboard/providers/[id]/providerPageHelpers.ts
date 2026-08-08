@@ -17,6 +17,8 @@ import {
 } from "@/lib/providers/requestDefaults";
 import { type CodexGlobalServiceMode } from "@/lib/providers/codexFastTier";
 import { CC_COMPATIBLE_DEFAULT_CHAT_PATH } from "./providerDetailConstants";
+import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry";
+import type { AlternateFormat } from "@omniroute/open-sse/config/providers/alternateFormats";
 import {
   type ProviderMessageTranslator,
   providerText,
@@ -128,8 +130,10 @@ export function validationBadgeProps(result: string): {
 /** A single model's outcome from a `/api/models/test-all` response. */
 export interface TestAllModelOutcome {
   status: "ok" | "error";
+  isQuota?: boolean;
   shouldHide: boolean;
 }
+type TestAllEntryStatus = "ok" | "error" | "slow";
 
 /**
  * Decide a model's per-row test status (the green/red icon) and whether it should
@@ -142,30 +146,35 @@ export interface TestAllModelOutcome {
  * model failed (unlike the single-model ▶ test).
  *
  * Auto-hide policy: when `autoHideFailed` is on, only NON-TRANSIENT failures are
- * hidden. Transient failures (rate-limited, timeout) are surfaced as 'error' on
- * the row icon but NOT hidden, because:
- *   - The provider may have been temporarily throttled during a parallel batch
- *     (a single Test All across 10+ models routinely trips per-account rate
- *     limits on subscription-tier APIs).
- *   - The model itself is not broken — a retry seconds later would succeed.
- *   - Hidden state persists across server restarts and silently removes the
- *     model from `/v1/models`, so a transient blip turns into a permanent
- *     catalog gap that the user can only recover from by editing the DB or
- *     hand-toggling each row.
+ * hidden. Transient failures remain visible because the model may still be healthy
+ * and hidden state persists across restarts, removing it from `/v1/models`.
  *
  * Genuine failures (`status:"error"` without a transient flag — e.g. upstream
  * 400 "invalid model", schema mismatch, auth failure) ARE still auto-hidden,
  * which is the intended use of the toggle.
  */
 export function evaluateTestAllEntry(
-  entry: { status?: "ok" | "error"; rateLimited?: boolean; isTimeout?: boolean } | null | undefined,
+  entry:
+    | {
+        status?: TestAllEntryStatus;
+        rateLimited?: boolean;
+        isTimeout?: boolean;
+        isTransient?: boolean;
+        isQuota?: boolean;
+      }
+    | null
+    | undefined,
   autoHideFailed: boolean
 ): TestAllModelOutcome {
   const ok = entry?.status === "ok";
-  const transient = Boolean(entry?.rateLimited || entry?.isTimeout);
+  const transient = [entry?.rateLimited, entry?.isTimeout, entry?.isTransient, entry?.isQuota].some(Boolean);
   return {
     status: ok ? "ok" : "error",
-    // Hide only persistent failures. Transient (rate-limited, timeout) are
+    // #9511: quota errors (isQuota) are surfaced on the icon but kept visible
+    // so an evening Test All on a free-tier provider doesn't silently wipe the
+    // catalog for the next day.
+    ...(entry?.isQuota ? { isQuota: true } : {}),
+    // Hide only persistent failures. Transient (rate-limited, timeout, quota) are
     // surfaced on the icon but kept visible so a single throttled batch test
     // does not silently wipe the catalog.
     shouldHide: !ok && autoHideFailed && !transient,
@@ -214,14 +223,25 @@ export function readBooleanToggle(value: unknown, fallback: boolean): boolean {
 export const CONFIGURABLE_BASE_URL_PROVIDERS = new Set([
   "azure-openai",
   "azure-ai",
-  "bailian-coding-plan",
   "xiaomi-mimo",
   "siliconflow",
   "heroku",
   "databricks",
   "snowflake",
   "searxng-search",
+  "firecrawl",
   "petals",
+  "comfyui",
+  // #7447 — Moonshot/Kimi's international host (api.moonshot.ai) rejects
+  // CN-region keys (issued on platform.kimi.com/moonshot.cn — a separate
+  // account/keyspace). Neither "kimi" (legacy id) nor "moonshot" (current
+  // user-facing id) previously exposed a base-URL field at Add-connection
+  // time, so a CN-region user had no way to point a new connection at
+  // api.moonshot.cn. resolveBaseUrl()/buildUrl() already honor a
+  // providerSpecificData.baseUrl override generically — this only exposes
+  // the existing override affordance for these two ids.
+  "kimi",
+  "moonshot",
 ]);
 
 export const DEFAULT_PROVIDER_BASE_URLS: Record<string, string> = {
@@ -231,7 +251,14 @@ export const DEFAULT_PROVIDER_BASE_URLS: Record<string, string> = {
   "xiaomi-mimo": "https://token-plan-sgp.xiaomimimo.com/v1",
   siliconflow: "https://api.siliconflow.com/v1",
   "searxng-search": "http://localhost:8888/search",
+  firecrawl: "https://api.firecrawl.dev",
   petals: "https://chat.petals.dev/api/v1/generate",
+  comfyui: "http://localhost:8188",
+  // #7447 — default stays the international host so existing/new
+  // international Kimi/Moonshot users see the same prefilled value as
+  // before; a CN-region user overrides it (see placeholder hint below).
+  kimi: "https://api.moonshot.ai/v1",
+  moonshot: "https://api.moonshot.ai/v1",
 };
 
 export function getLocalProviderMetadata(providerId?: string | null) {
@@ -263,6 +290,16 @@ export function isBaseUrlOverrideEligibleProvider(providerId?: string | null): b
   if (!providerId) return false;
   if (isBaseUrlConfigurableProvider(providerId)) return false;
   return true;
+}
+
+/**
+ * Alternate API protocols the provider declares in the registry (e.g. an
+ * Anthropic-compatible endpoint alongside the default OpenAI one). An empty list
+ * means the protocol selector stays hidden for this provider.
+ */
+export function getAlternateFormats(providerId?: string | null): AlternateFormat[] {
+  if (!providerId) return [];
+  return getRegistryEntry(providerId)?.alternateFormats ?? [];
 }
 
 export function getProviderBaseUrlDefault(providerId?: string | null) {
@@ -299,6 +336,8 @@ export function getProviderBaseUrlHint(
       return t ? t("snowflakeBaseUrlHint") : undefined;
     case "searxng-search":
       return t ? t("searxngBaseUrlHint") : undefined;
+    case "firecrawl":
+      return t ? t("firecrawlBaseUrlHint") : undefined;
     default:
       return undefined;
   }
@@ -313,6 +352,8 @@ export function getProviderBaseUrlPlaceholder(providerId?: string | null) {
       return "https://my-resource.openai.azure.com";
     case "bailian-coding-plan":
     case "xiaomi-mimo":
+    case "comfyui":
+    case "firecrawl":
       return getProviderBaseUrlDefault(providerId);
     case "siliconflow":
       return "https://api.siliconflow.cn/v1";
@@ -324,6 +365,11 @@ export function getProviderBaseUrlPlaceholder(providerId?: string | null) {
       return "https://example-account.snowflakecomputing.com";
     case "searxng-search":
       return "http://localhost:8888/search";
+    case "kimi":
+    case "moonshot":
+      // #7447 — surfaces the CN-region alternative host as the placeholder
+      // example (mirrors the siliconflow.com/siliconflow.cn pattern above).
+      return "https://api.moonshot.cn/v1";
     default:
       return "";
   }
@@ -337,29 +383,9 @@ export function isGlmProvider(providerId?: string | null) {
 // Routing-tags / excluded-models parse + format
 // ---------------------------------------------------------------------------
 
-export function parseRoutingTagsInput(value: string): string[] | undefined {
-  const tags = Array.from(
-    new Set(
-      value
-        .split(",")
-        .map((tag) => tag.trim().toLowerCase())
-        .filter(Boolean)
-    )
-  );
-  return tags.length > 0 ? tags : undefined;
-}
-
-export function parseExcludedModelsInput(value: string): string[] | undefined {
-  const patterns = Array.from(
-    new Set(
-      value
-        .split(",")
-        .map((pattern) => pattern.trim())
-        .filter(Boolean)
-    )
-  );
-  return patterns.length > 0 ? patterns : undefined;
-}
+// parseRoutingTagsInput / parseExcludedModelsInput moved to the pure leaf
+// providerInputParsers.ts (kept re-exported here for existing UI importers).
+export { parseExcludedModelsInput, parseRoutingTagsInput } from "./providerInputParsers";
 
 export function formatRoutingTagsInput(value: unknown): string {
   if (!Array.isArray(value)) return "";

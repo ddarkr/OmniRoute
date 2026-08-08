@@ -2,7 +2,7 @@ import { z } from "zod";
 import { deleteProxyById, listProxies, updateProxy } from "@/lib/localDb";
 import { createErrorResponseFromUnknown } from "@/lib/api/errorResponse";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { createProxyDispatcher } from "@omniroute/open-sse/utils/proxyDispatcher";
+import { createProxyDispatcher, proxyConfigToUrl } from "@omniroute/open-sse/utils/proxyDispatcher";
 import { fetch as undiciFetch } from "undici";
 import { resolveHealthCheckStatusWrite } from "@/lib/proxyHealth/statusPolicy";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
@@ -28,8 +28,31 @@ interface TestResult {
   error?: string;
 }
 
-async function testSingleProxy(proxy: { id: string; type: string; host: string; port: number }): Promise<TestResult> {
-  const proxyUrl = `${proxy.type}://${proxy.host}:${proxy.port}`;
+async function testSingleProxy(proxy: {
+  id: string;
+  type: string;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  family?: string;
+}): Promise<TestResult> {
+  let proxyUrl: string | null;
+  try {
+    proxyUrl = proxyConfigToUrl(proxy);
+  } catch {
+    proxyUrl = null;
+  }
+  if (!proxyUrl) {
+    return {
+      proxyId: proxy.id,
+      host: proxy.host,
+      port: proxy.port,
+      alive: false,
+      latencyMs: null,
+      error: "Invalid proxy config (check type, host, port)",
+    };
+  }
   const start = Date.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TEST_TIMEOUT_MS);
@@ -84,13 +107,18 @@ export async function POST(request: Request) {
 
   const validation = validateBody(autoTestSchema, rawBody);
   if (isValidationFailure(validation)) {
-    return createErrorResponse({ status: 400, message: validation.error.message, type: "invalid_request" });
+    return createErrorResponse({
+      status: 400,
+      message: validation.error.message,
+      type: "invalid_request",
+    });
   }
 
   const { ids: specificIds, autoRemove } = validation.data;
 
   try {
-    const allProxies = await listProxies({ includeSecrets: false });
+    const result = await listProxies({ includeSecrets: true });
+    const allProxies = result.items;
     const proxiesToTest = specificIds
       ? allProxies.filter((p) => specificIds.includes(p.id))
       : allProxies;
@@ -114,7 +142,9 @@ export async function POST(request: Request) {
         if (!r.alive) {
           try {
             if (await deleteProxyById(r.proxyId, { force: true })) removed.push(r.proxyId);
-          } catch { /* skip */ }
+          } catch {
+            /* skip */
+          }
         }
       }
     }

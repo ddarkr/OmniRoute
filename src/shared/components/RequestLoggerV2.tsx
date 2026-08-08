@@ -543,7 +543,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
       try {
         const url = new URL(globalThis.location.href);
         url.searchParams.set("id", logEntry.id);
-        router.replace(url.pathname + url.search);
+        router.replace(url.pathname + url.search, { scroll: false });
       } catch (e) {
         // ignore navigation errors
       }
@@ -616,7 +616,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
         // remove id param when closing detail
         const url = new URL(globalThis.location.href);
         url.searchParams.delete("id");
-        router.replace(url.pathname + url.search);
+        router.replace(url.pathname + url.search, { scroll: false });
       } catch (e) {
         // ignore navigation errors
       }
@@ -1256,7 +1256,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                       text: "#fff",
                       label: compatLabel || (log.provider || "-").toUpperCase(),
                     };
-                    const providerLabel = compatLabel || providerColor.label;
+                    const providerLabel = log.providerDisplay || compatLabel || providerColor.label;
                     const isError = !isActive && log.status >= 400;
                     const cacheSourceMeta = getCacheSourceMeta(log.cacheSource);
                     const isSemanticCache = cacheSourceMeta?.key === "semantic";

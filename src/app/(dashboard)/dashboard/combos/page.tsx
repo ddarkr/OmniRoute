@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, memo } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -12,6 +12,7 @@ import Input from "@/shared/components/Input";
 import Modal from "@/shared/components/Modal";
 import Toggle from "@/shared/components/Toggle";
 import Tooltip from "@/shared/components/Tooltip";
+import { ComboCompressionModeSelect } from "@/shared/components/compression/ComboCompressionModeSelect";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { FieldLabelWithHelp, WeightTotalBar } from "./parts";
 import { useComboProxyAssignments } from "./useComboProxyAssignments";
@@ -27,18 +28,23 @@ import {
   buildManualComboModelStep,
   buildPrecisionComboModelStep,
   canAccessComboBuilderStage,
+  computeBatchAddModelSteps,
+  computeBatchDeselectModelSteps,
   findNextSuggestedConnectionId,
   getComboBuilderStageChecks,
   getComboBuilderStages,
   getNextComboBuilderStage,
   getPreviousComboBuilderStage,
   hasExactModelStepDuplicate,
+  isEligibleActiveConnection,
   isIntelligentBuilderStrategy,
   parseQualifiedModel,
   resolveComboBuilderProviderId,
 } from "@/lib/combos/builderDraft";
 import { normalizeComboConfigMode } from "@/shared/constants/comboConfigMode";
 import AutoComboCatalog from "./AutoComboCatalog";
+import KimiComboPresetCard from "./KimiComboPresetCard";
+import { KIMI_CODING_PRESET, hasKimiCodingPreset } from "./kimiComboPreset";
 import BuilderIntelligentStep from "./BuilderIntelligentStep";
 import IntelligentComboPanel from "./IntelligentComboPanel";
 import {
@@ -48,6 +54,7 @@ import {
   normalizeIntelligentRoutingFilter,
   normalizeIntelligentRoutingConfig,
 } from "@/lib/combos/intelligentRouting";
+import { getComboStepTarget } from "@/lib/combos/steps";
 import { resolveServerErrorMessage } from "@/lib/api/serverErrorMessage";
 import { useTranslations } from "next-intl";
 
@@ -405,7 +412,7 @@ const COMBO_TEMPLATE_FALLBACK = {
   balancedDesc: "Least-used routing to spread demand over time.",
   freeStackTitle: "Free Stack ($0)",
   freeStackDesc:
-    "Round-robin across free providers: Kiro, Qoder, Qwen, Antigravity CLI. Zero cost, never stops.",
+    "Round-robin across free providers: Kiro, Qoder, Antigravity CLI. Zero cost, never stops.",
   paidPremiumTitle: "Paid Premium",
   paidPremiumDesc:
     "Round-robin across paid subscriptions: Cursor, Antigravity. Top-tier models, distributed load.",
@@ -564,6 +571,13 @@ function normalizeModelEntry(entry) {
       weight: entry.weight || 0,
     };
   }
+  if (entry?.kind === "provider-wildcard") {
+    return {
+      ...entry,
+      model: getComboStepTarget(entry),
+      weight: entry.weight || 0,
+    };
+  }
   return {
     ...entry,
     model: entry.model,
@@ -574,6 +588,7 @@ function normalizeModelEntry(entry) {
 function getModelString(entry) {
   if (typeof entry === "string") return entry;
   if (entry?.kind === "combo-ref") return entry.comboName;
+  if (entry?.kind === "provider-wildcard") return getComboStepTarget(entry);
   return entry.model;
 }
 
@@ -627,6 +642,37 @@ function formatComboEntryDisplay(
   const normalizedEntry = normalizeModelEntry(entry);
   if (normalizedEntry.kind === "combo-ref") {
     return `Combo → ${normalizedEntry.comboName}`;
+  }
+
+  if (normalizedEntry.kind === "provider-wildcard") {
+    const providerIdentifier = normalizedEntry.providerId;
+    const builderProvider = findBuilderProviderByIdentifier(builderProviders, providerIdentifier);
+    const providerNode = findProviderNodeByIdentifier(providerNodes, providerIdentifier);
+    const providerLabel =
+      builderProvider?.displayName || providerNode?.name || providerIdentifier || "provider";
+    const patternLabel = normalizedEntry.modelPattern || "*";
+    const wildcardLabel = `${providerLabel}/${patternLabel}`;
+
+    if (!includeConnection) {
+      return wildcardLabel;
+    }
+
+    const connectionId = normalizedEntry.connectionId || null;
+    const rawConnectionLabel =
+      (connectionId &&
+        builderProvider?.connections?.find((connection) => connection.id === connectionId)
+          ?.label) ||
+      normalizedEntry.label ||
+      null;
+    const connectionLabel = rawConnectionLabel
+      ? pickDisplayValue([rawConnectionLabel], showFullEmails, rawConnectionLabel)
+      : null;
+
+    if (connectionId) {
+      return `${wildcardLabel} · ${connectionLabel || `acct ${connectionId.slice(0, 8)}`}`;
+    }
+
+    return `${wildcardLabel} · dynamic account`;
   }
 
   const parsed = parseQualifiedModel(normalizedEntry.model);
@@ -686,6 +732,7 @@ export default function CombosPage() {
   const [providerNodes, setProviderNodes] = useState([]);
   const [showUsageGuide, setShowUsageGuide] = useState(true);
   const [recentlyCreatedCombo, setRecentlyCreatedCombo] = useState("");
+  const [creatingKimiPreset, setCreatingKimiPreset] = useState(false);
   const [comboDragIndex, setComboDragIndex] = useState(null);
   const [comboDragOverIndex, setComboDragOverIndex] = useState(null);
   const [savingComboOrder, setSavingComboOrder] = useState(false);
@@ -770,9 +817,7 @@ export default function CombosPage() {
 
       if (combosRes.ok) setCombos((combosData.combos || []).filter((c) => !c.isHidden));
       if (providersRes.ok) {
-        const active = (providersData.connections || []).filter(
-          (c) => c.testStatus === "active" || c.testStatus === "success"
-        );
+        const active = (providersData.connections || []).filter(isEligibleActiveConnection);
         setActiveProviders(active);
       }
       if (metricsRes.ok) setMetrics(metricsData.metrics || {});
@@ -856,6 +901,18 @@ export default function CombosPage() {
     };
 
     await handleCreate(data);
+  };
+
+  // Kimi Coding preset (2026-07 partnership) — one-click create, mirrors
+  // handleDuplicate's directness (no separate confirmation modal). See
+  // KimiComboPresetCard.tsx for why this bypasses the combo builder wizard.
+  const handleCreateKimiPreset = async () => {
+    setCreatingKimiPreset(true);
+    try {
+      await handleCreate(KIMI_CODING_PRESET);
+    } finally {
+      setCreatingKimiPreset(false);
+    }
   };
 
   const handleTestCombo = async (combo) => {
@@ -1039,6 +1096,12 @@ export default function CombosPage() {
       </div>
 
       <AutoComboCatalog />
+
+      <KimiComboPresetCard
+        alreadyCreated={hasKimiCodingPreset(combos)}
+        creating={creatingKimiPreset}
+        onCreate={handleCreateKimiPreset}
+      />
 
       {showUsageGuide && (
         <ComboUsageGuide
@@ -1549,7 +1612,7 @@ function ComboReadinessPanel({ checks, blockers, showDescription = true }) {
   );
 }
 
-function ComboCard({
+function ComboCardInner({
   combo,
   metrics,
   compressionEnabled,
@@ -1578,46 +1641,6 @@ function ComboCard({
   const tc = useTranslations("common");
   const emailsVisible = useEmailPrivacyStore((s) => s.emailsVisible);
   const strategyDescription = getStrategyDescription(t, strategy);
-  const hasRuntimeConfig = combo?.config && typeof combo.config === "object";
-  const initialCompressionMode =
-    typeof combo?.config?.compressionMode === "string"
-      ? combo.config.compressionMode
-      : hasRuntimeConfig
-        ? ""
-        : combo.compressionOverride || "";
-  const [compressionOverride, setCompressionOverride] = useState(initialCompressionMode);
-  const [isSavingCompression, setIsSavingCompression] = useState(false);
-
-  useEffect(() => {
-    setCompressionOverride(initialCompressionMode);
-  }, [initialCompressionMode]);
-
-  const handleCompressionOverrideChange = async (value) => {
-    setCompressionOverride(value);
-    setIsSavingCompression(true);
-    const nextConfig = { ...(combo.config || {}) };
-    if (value) {
-      nextConfig.compressionMode = value;
-    } else {
-      delete nextConfig.compressionMode;
-    }
-    try {
-      const response = await fetch(`/api/combos/${combo.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ config: nextConfig }),
-      });
-      if (!response.ok) {
-        console.error("Failed to update compression override");
-        setCompressionOverride(initialCompressionMode);
-      }
-    } catch (error) {
-      console.error("Error updating compression override:", error);
-      setCompressionOverride(initialCompressionMode);
-    } finally {
-      setIsSavingCompression(false);
-    }
-  };
 
   return (
     <Card
@@ -1747,32 +1770,11 @@ function ComboCard({
           </div>
           <div className="flex items-center gap-1.5 transition-opacity">
             {compressionEnabled && (
-              <select
-                value={compressionOverride}
-                onChange={(e) => handleCompressionOverrideChange(e.target.value)}
-                disabled={isSavingCompression}
-                className="text-xs py-1 px-2 rounded border border-black/10 dark:border-white/10 bg-surface text-text-main focus:border-primary focus:outline-none transition-colors disabled:opacity-50 max-w-[130px] md:max-w-none"
+              <ComboCompressionModeSelect
+                combo={combo}
                 title={t("compressionOverride")}
-              >
-                <option value="" className="bg-surface text-text-main">
-                  Default
-                </option>
-                <option value="off" className="bg-surface text-text-main">
-                  Off
-                </option>
-                <option value="lite" className="bg-surface text-text-main">
-                  Lite
-                </option>
-                <option value="standard" className="bg-surface text-text-main">
-                  Standard
-                </option>
-                <option value="aggressive" className="bg-surface text-text-main">
-                  Aggressive
-                </option>
-                <option value="ultra" className="bg-surface text-text-main">
-                  Ultra
-                </option>
-              </select>
+                className="text-xs py-1 px-2 rounded border border-black/10 dark:border-white/10 bg-surface text-text-main focus:border-primary focus:outline-none transition-colors disabled:opacity-50 max-w-[130px] md:max-w-none"
+              />
             )}
             <Link
               href={`/dashboard/combos/${combo.id}`}
@@ -1828,6 +1830,7 @@ function ComboCard({
     </Card>
   );
 }
+const ComboCard = memo(ComboCardInner);
 
 function TestResultsView({ results }) {
   const emailsVisible = useEmailPrivacyStore((s) => s.emailsVisible);
@@ -2569,6 +2572,26 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     setBuilderError("");
   };
 
+  // Batch add for ModelSelectModal "Select all" — delegates to the pure
+  // computeBatchAddModelSteps (src/lib/combos/builderDraft.ts) which applies
+  // every candidate against a growing list in one pass, otherwise N× onSelect
+  // would each close over the same stale `models` snapshot and keep only the
+  // last entry. Extracted so tests exercise this real implementation instead
+  // of a hand-maintained mirror (#8526).
+  const handleAddModels = (selected) => {
+    const { next, addedAny } = computeBatchAddModelSteps(models, selected, builderProviders);
+    if (!addedAny) return;
+    setModels(next);
+    setBuilderError("");
+  };
+
+  const handleDeselectModels = (toRemove) => {
+    const next = computeBatchDeselectModelSteps(models, toRemove);
+    if (next === models) return;
+    setModels(next);
+    setBuilderError("");
+  };
+
   const handleWeightChange = (index, weight) => {
     const newModels = [...models];
     newModels[index] = {
@@ -2637,7 +2660,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
   };
 
   const FREE_STACK_PRESET_MODELS = [
-    { model: "agy/gemini-3.5-flash-medium", weight: 0 },
+    { model: "agy/gemini-3.5-flash-low", weight: 0 },
     { model: "kr/claude-sonnet-4.5", weight: 0 },
     { model: "if/kimi-k2-thinking", weight: 0 },
     { model: "if/qwen3-coder-plus", weight: 0 },
@@ -2650,8 +2673,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     { model: "cu/claude-4.6-opus-high", weight: 0 },
     { model: "antigravity/claude-sonnet-4-6", weight: 0 },
     { model: "cu/claude-4.6-sonnet-high", weight: 0 },
-    { model: "antigravity/gemini-3.1-pro-high", weight: 0 },
-    { model: "antigravity/gemini-3-pro-high", weight: 0 },
+    { model: "antigravity/gemini-pro-agent", weight: 0 },
   ];
 
   const applyTemplate = (template) => {
@@ -3438,15 +3460,25 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
                         <div className="text-[10px] text-text-muted truncate">
                           {entry.kind === "combo-ref"
                             ? getI18nOrFallback(t, "builderComboRefStep", "Nested combo reference")
-                            : entry.connectionId
-                              ? getI18nOrFallback(t, "builderPinnedAccount", "Pinned account")
-                              : entry.providerId
-                                ? getI18nOrFallback(
-                                    t,
-                                    "builderDynamicAccountShort",
-                                    "Dynamic account"
-                                  )
-                                : getI18nOrFallback(t, "builderLegacyEntry", "Legacy model entry")}
+                            : entry.kind === "provider-wildcard"
+                              ? getI18nOrFallback(
+                                  t,
+                                  "builderProviderWildcard",
+                                  "All matching provider models"
+                                )
+                              : entry.connectionId
+                                ? getI18nOrFallback(t, "builderPinnedAccount", "Pinned account")
+                                : entry.providerId
+                                  ? getI18nOrFallback(
+                                      t,
+                                      "builderDynamicAccountShort",
+                                      "Dynamic account"
+                                    )
+                                  : getI18nOrFallback(
+                                      t,
+                                      "builderLegacyEntry",
+                                      "Legacy model entry"
+                                    )}
                         </div>
                       </div>
 
@@ -3963,8 +3995,16 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
                         }
                         className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-surface-1 focus:border-primary focus:outline-none"
                       >
-                        <option value="flatten">Flatten nested combos</option>
-                        <option value="execute">Execute nested combos as targets</option>
+                        <option value="flatten">
+                          {getI18nOrFallback(t, "nestedComboFlatten", "Flatten nested combos")}
+                        </option>
+                        <option value="execute">
+                          {getI18nOrFallback(
+                            t,
+                            "nestedComboExecute",
+                            "Execute nested combos as targets"
+                          )}
+                        </option>
                       </select>
                     </div>
                     {/* #6168: per-combo session-stickiness override (tri-state so it can
@@ -4552,19 +4592,25 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
                                     "builderComboRefStep",
                                     "Nested combo reference"
                                   )
-                                : entry.connectionId
-                                  ? getI18nOrFallback(t, "builderPinnedAccount", "Pinned account")
-                                  : entry.providerId
-                                    ? getI18nOrFallback(
-                                        t,
-                                        "builderDynamicAccountShort",
-                                        "Dynamic account"
-                                      )
-                                    : getI18nOrFallback(
-                                        t,
-                                        "builderLegacyEntry",
-                                        "Legacy model entry"
-                                      )}
+                                : entry.kind === "provider-wildcard"
+                                  ? getI18nOrFallback(
+                                      t,
+                                      "builderProviderWildcard",
+                                      "All matching provider models"
+                                    )
+                                  : entry.connectionId
+                                    ? getI18nOrFallback(t, "builderPinnedAccount", "Pinned account")
+                                    : entry.providerId
+                                      ? getI18nOrFallback(
+                                          t,
+                                          "builderDynamicAccountShort",
+                                          "Dynamic account"
+                                        )
+                                      : getI18nOrFallback(
+                                          t,
+                                          "builderLegacyEntry",
+                                          "Legacy model entry"
+                                        )}
                               {strategy === "weighted" && entry.weight > 0
                                 ? ` · ${entry.weight}%`
                                 : ""}
@@ -4642,6 +4688,8 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
         onClose={() => setShowModelSelect(false)}
         onSelect={handleAddModel}
         onDeselect={handleDeselectModel}
+        onSelectMany={handleAddModels}
+        onDeselectMany={handleDeselectModels}
         activeProviders={activeProviders}
         modelAliases={modelAliases}
         title={t("addModelToCombo")}

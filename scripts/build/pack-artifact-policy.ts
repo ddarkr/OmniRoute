@@ -86,6 +86,12 @@ export const PACK_ARTIFACT_ROOT_ALLOWED_EXACT_PATHS: string[] = [
   ".env.example",
   "LICENSE",
   "README.md",
+  "bin/aliasResolver.mjs",
+  // #7808: ESM loader hook split out of bin/aliasResolver.mjs to silence CodeQL
+  // js/incomplete-url-substring-sanitization (the old code built a
+  // `data:text/javascript,...` URL dynamically). Loaded via pathToFileURL() at
+  // runtime; shipped via package.json "files", so it must be allowed here.
+  "bin/aliasResolverHook.mjs",
   "bin/mcp-server.mjs",
   "bin/nodeRuntimeSupport.mjs",
   "bin/omniroute.mjs",
@@ -117,6 +123,12 @@ export const PACK_ARTIFACT_ROOT_ALLOWED_EXACT_PATHS: string[] = [
   "scripts/build/postinstall.mjs",
   "scripts/build/postinstallSupport.mjs",
   "scripts/build/colocateOptionals.mjs",
+  // #7802: imported by scripts/build/postinstall.mjs to repair tls-client-node's
+  // native binary (chatgpt-web/claude-web/grok-web/lmarena/perplexity-web transport).
+  "scripts/build/fixTlsClientNodeBinary.mjs",
+  // #8859: imported by scripts/build/postinstall.mjs to repair playwright-core's
+  // browser resolution on Termux/Android (no glibc, no bundled browsers).
+  "scripts/build/fixPlaywrightAndroid.mjs",
   // #5227: imported at runtime by bin/cli/commands/serve.mjs (heap auto-calibration).
   "scripts/build/runtime-env.mjs",
   "scripts/build/sync-env.mjs",
@@ -167,15 +179,24 @@ export const PACK_ARTIFACT_REQUIRED_PATHS: string[] = [
   // required entries make its absence loud (#7065 class; derived + enforced by
   // tests/unit/pack-artifact-entrypoint-closures.test.ts).
   "bin/cli/data-dir.mjs",
+  "bin/cli/utils/ensureAndroidCacheDir.mjs",
   "bin/cli/utils/storageKeyProvision.mjs",
+  "bin/cli/utils/versionFastPath.mjs",
   "bin/mcp-server.mjs",
   "bin/nodeRuntimeSupport.mjs",
   "bin/omniroute.mjs",
+  // #7808: aliasResolver + its hook file. bin/omniroute.mjs imports
+  // bin/aliasResolver.mjs at startup, which in turn registers
+  // bin/aliasResolverHook.mjs as the ESM loader. Both must ship in the tarball
+  // or the CLI fails to boot — list them REQUIRED so a regression is loud.
+  "bin/aliasResolver.mjs",
+  "bin/aliasResolverHook.mjs",
   "package.json",
   "scripts/build/native-binary-compat.mjs",
   "scripts/build/postinstall.mjs",
   "scripts/build/postinstallSupport.mjs",
   "scripts/build/colocateOptionals.mjs",
+  "scripts/build/fixTlsClientNodeBinary.mjs",
   "scripts/build/runtime-env.mjs",
   "src/shared/utils/nodeRuntimeSupport.ts",
 ];
@@ -191,6 +212,19 @@ export function normalizeArtifactPath(filePath: string): string {
     .replace(/\/{2,}/g, "/");
 }
 
+/**
+ * Paths that are NEVER publishable, whatever the allowlist says.
+ *
+ * Existence reason: the allowlist grants whole prefixes (e.g.
+ * `@omniroute/opencode-provider/`), so a nested `node_modules` inside an allowed
+ * prefix used to be authorized by it. That shipped 79 MB of devDependencies
+ * (tsup/esbuild/typescript) — 80% of the tarball — whenever the publish ran from
+ * a machine where someone had installed inside that subpackage. `files[]` in
+ * package.json now excludes it at the source; this is the gate that FAILS if it
+ * ever comes back instead of silently allowing it.
+ */
+export const PACK_ARTIFACT_NEVER_ALLOWED_SEGMENTS: string[] = ["node_modules"];
+
 export function findUnexpectedArtifactPaths(
   filePaths: string[],
   { exactPaths = [], prefixPaths = [] }: { exactPaths?: string[]; prefixPaths?: string[] } = {}
@@ -198,13 +232,17 @@ export function findUnexpectedArtifactPaths(
   const normalizedExact = new Set(exactPaths.map(normalizeArtifactPath));
   const normalizedPrefixes = prefixPaths.map(normalizeArtifactPath);
 
+  const hasForbiddenSegment = (filePath: string): boolean =>
+    filePath.split("/").some((segment) => PACK_ARTIFACT_NEVER_ALLOWED_SEGMENTS.includes(segment));
+
   return filePaths
     .map(normalizeArtifactPath)
     .filter(Boolean)
     .filter(
       (filePath) =>
-        !normalizedExact.has(filePath) &&
-        !normalizedPrefixes.some((prefix) => filePath.startsWith(prefix))
+        hasForbiddenSegment(filePath) ||
+        (!normalizedExact.has(filePath) &&
+          !normalizedPrefixes.some((prefix) => filePath.startsWith(prefix)))
     )
     .sort();
 }

@@ -1,4 +1,5 @@
 export { parseQuotaData } from "./quotaParsing";
+import { hasFixedQuotaOrder } from "./quotaParsing";
 
 const PROVIDER_PLAN_FALLBACKS = new Set([
   "claude code",
@@ -179,9 +180,11 @@ export function calculatePercentage(used, total) {
  * Resolve the best available plan label using live usage first, then persisted
  * provider-specific connection metadata.
  */
-export function resolvePlanValue(plan, providerSpecificData) {
-  const psd = toRecord(providerSpecificData);
+export function resolvePlanValue(plan, providerSpecificData, providerId) {
   const livePlan = normalizePlanCandidate(plan);
+  if (String(providerId || "").toLowerCase() === "grok-cli") return livePlan || null;
+
+  const psd = toRecord(providerSpecificData);
   const persistedCandidates = [
     psd.workspacePlanType,
     psd.plan,
@@ -193,6 +196,12 @@ export function resolvePlanValue(plan, providerSpecificData) {
     psd.organizationRateLimitTier,
     psd.rateLimitTier,
     psd.organizationType,
+    // Codex OAuth bootstrap: chatgpt_plan_type is captured at import time
+    // (src/lib/oauth/services/codexImport.ts) and is the only source of the
+    // plan when the live Codex usage endpoint omits plan_type/planType (the
+    // usage service then reports the literal string "unknown" — see
+    // open-sse/services/usage/codex.ts).
+    psd.chatgptPlanType,
   ];
 
   if (livePlan && normalizePlanTier(livePlan).key !== "free") {
@@ -205,6 +214,29 @@ export function resolvePlanValue(plan, providerSpecificData) {
   }
 
   return livePlan || null;
+}
+
+/**
+ * Page-level Provider Limits plan map used by tier stats/filters.
+ * Always passes provider so grok-cli never classifies from persisted PSD tiers.
+ */
+export function buildProviderLimitsResolvedPlans(
+  connections: Array<{
+    id: string;
+    provider?: string | null;
+    providerSpecificData?: unknown;
+  }>,
+  quotaData: Record<string, { plan?: unknown } | null | undefined>
+): Record<string, string | null> {
+  const out: Record<string, string | null> = {};
+  for (const conn of connections) {
+    out[conn.id] = resolvePlanValue(
+      quotaData[conn.id]?.plan,
+      conn.providerSpecificData,
+      conn.provider
+    );
+  }
+  return out;
 }
 
 function unknownPlanTier(raw: string | null = null) {
@@ -298,6 +330,25 @@ export function normalizePlanTier(plan) {
 
 // === Card Grid Helpers (T7) =================================================
 
+// Card action-availability derivations. Extracted from QuotaCard so its
+// `.some(...)` predicate branches don't count against the component's
+// cyclomatic-complexity budget.
+export function computeCanEditCutoff(quotas: any[]): boolean {
+  return quotas.some((q: any) => q && typeof q.name === "string" && !q.isCredits);
+}
+
+export function computeCanRedeemResetCredit(provider: string, quotas: any[]): boolean {
+  return (
+    provider === "codex" &&
+    quotas.some((q: any) => q?.isResetCredits && Number(q.creditCount ?? q.remaining ?? 0) > 0)
+  );
+}
+
+export function hasQuotaCutoffOverrides(connection: any): boolean {
+  const overrides = (connection.quotaWindowThresholds as Record<string, number> | null) || null;
+  return !!overrides && Object.keys(overrides).length > 0;
+}
+
 export const STATUS_EMOJI = {
   critical: "🔴",
   alert: "🟡",
@@ -338,8 +389,18 @@ const STATUS_ORDER: Record<"critical" | "alert" | "ok", number> = {
   ok: 2,
 };
 
-export function topQuotas(quotas: any[], n = 3): any[] {
-  return [...quotas.filter(Boolean)]
+export function topQuotas(quotas: any[], n = 3, providerId?: string): any[] {
+  const filtered = quotas.filter(Boolean);
+
+  // Providers with a deterministic fixed-window order (codex, glm family — see
+  // quotaParsing.ts's sortCodexOrder()/sortGlmOrder()) must keep the order
+  // parseQuotaData() already established rather than being re-sorted by
+  // status/remaining-%, which would undo it (#6687's collapsed-card sibling, #7764).
+  if (hasFixedQuotaOrder(providerId)) {
+    return filtered.slice(0, n);
+  }
+
+  return [...filtered]
     .sort((a, b) => {
       const sa = STATUS_ORDER[quotaStatus(a)];
       const sb = STATUS_ORDER[quotaStatus(b)];
@@ -474,6 +535,52 @@ export function filterHiddenModelQuotas(
   });
 }
 
+// --- Per-user quota row visibility (upstream 9router#2371 port) ---------
+// Distinct from collectHiddenQuotaModelIds()/filterHiddenModelQuotas() above:
+// those hide rows for models the ADMIN marked isHidden/isDeleted in the model
+// catalog. These hide rows the OPERATOR clicked "hide" on for their own view
+// (persisted per-provider in settings.quotaVisibility), independent of model
+// catalog state — e.g. temporarily decluttering a quota card without editing
+// the catalog. Both mechanisms can apply to the same row.
+
+/** Stable identity for a quota row: prefer modelKey (survives displayName i18n), fall back to name. */
+export function getQuotaVisibilityKey(quota: any): string {
+  if (!quota || typeof quota !== "object") return "";
+  return String(quota.modelKey || quota.name || "").trim();
+}
+
+function getProviderHiddenQuotaSet(
+  provider: string,
+  quotaVisibility: Record<string, { hidden?: string[] }> | undefined
+): Set<string> {
+  const hidden = quotaVisibility?.[provider]?.hidden;
+  return new Set(Array.isArray(hidden) ? hidden.map(String) : []);
+}
+
+/** Returns quotas for `provider` with any operator-hidden rows removed. */
+export function filterQuotasByVisibility(
+  provider: string,
+  quotas: any[] = [],
+  quotaVisibility: Record<string, { hidden?: string[] }> = {}
+): any[] {
+  if (!Array.isArray(quotas) || quotas.length === 0) return [];
+  const hidden = getProviderHiddenQuotaSet(provider, quotaVisibility);
+  if (hidden.size === 0) return quotas;
+  return quotas.filter((quota) => !hidden.has(getQuotaVisibilityKey(quota)));
+}
+
+/** Returns the subset of `quotas` for `provider` the operator hid (for the "Hidden: …" chip row). */
+export function getHiddenQuotaRows(
+  provider: string,
+  quotas: any[] = [],
+  quotaVisibility: Record<string, { hidden?: string[] }> = {}
+): any[] {
+  if (!Array.isArray(quotas) || quotas.length === 0) return [];
+  const hidden = getProviderHiddenQuotaSet(provider, quotaVisibility);
+  if (hidden.size === 0) return [];
+  return quotas.filter((quota) => hidden.has(getQuotaVisibilityKey(quota)));
+}
+
 // --- Provider dropdown filter (PR #769 port) -----------------------------
 // Pure helpers extracted from <ProviderLimits/> so the filter+dropdown logic
 // can be exercised by unit tests without rendering React. Keep them free of
@@ -512,4 +619,111 @@ export function buildProviderOptions(
     }
   }
   return Array.from(seen).sort(compare);
+}
+
+// --- Deterministic quota-card ordering -------------------------------------
+// Mirrors the dashboard/providers rule (`providerPageUtils.ts::
+// sortProviderEntriesByName`): every level of ordering must end in a stable,
+// data-independent tiebreak so cards never re-flow between refreshes.
+//
+// Before this, `visibleConnections` globally sorted ALL connections by
+// status then soonest reset, and QuotaCardGrid grouped by first-appearance —
+// so each provider group's position was decided by whichever of its accounts
+// happened to sort first (status/reset change every refresh → groups
+// shuffled). Provider rank is now a sort key again, so a group's position is
+// fixed by PROVIDER_ORDER and account status/reset only orders accounts
+// inside their own group.
+
+export interface QuotaOrderConnection {
+  id?: unknown;
+  provider?: unknown;
+  name?: unknown;
+  email?: unknown;
+  displayName?: unknown;
+}
+
+/** Label/name key: providers-page `getProviderSortLabel` — case-insensitive display name. */
+function quotaConnLabel(conn: QuotaOrderConnection): string {
+  const name = typeof conn.name === "string" ? conn.name : "";
+  const provider = typeof conn.provider === "string" ? conn.provider : "";
+  return (name || provider).toLowerCase();
+}
+
+/** Technical tiebreak key: providers-page `providerId.localeCompare(...)` — ASCII on purpose. */
+function quotaConnTiebreak(conn: QuotaOrderConnection): string {
+  const email = typeof conn.email === "string" ? conn.email : "";
+  const id = typeof conn.id === "string" ? conn.id : String(conn.id ?? "");
+  return email || id;
+}
+
+function providerRank(provider: unknown, providerOrder: Record<string, number>): number {
+  const key = typeof provider === "string" ? provider : "";
+  return providerOrder[key] ?? 99;
+}
+
+/**
+ * Order connections for the quota card grid. Levels (first non-zero wins):
+ *   1. `PROVIDER_ORDER` rank — keeps each provider group glued to its fixed slot.
+ *   2. Provider label (locale-aware, case-insensitive) — orders unranked providers.
+ *   3. Provider key ASCII — deterministic tiebreak between aliased/equal labels.
+ *   4. `accountCompare` (optional) — in-group intent (critical-first, soonest reset).
+ *   5. Account label, then email/id ASCII — so equal-status accounts never shuffle.
+ */
+export function compareQuotaConnections<T extends QuotaOrderConnection>(
+  a: T,
+  b: T,
+  opts: {
+    providerOrder: Record<string, number>;
+    providerLabels?: Record<string, string>;
+    accountCompare?: (a: T, b: T) => number;
+    compare?: (a: string, b: string) => number;
+  }
+): number {
+  const cmp = opts.compare ?? ((x: string, y: string) => x.localeCompare(y));
+  const labels = opts.providerLabels ?? {};
+
+  const ra = providerRank(a.provider, opts.providerOrder);
+  const rb = providerRank(b.provider, opts.providerOrder);
+  if (ra !== rb) return ra - rb;
+
+  const pa = typeof a.provider === "string" ? a.provider : "";
+  const pb = typeof b.provider === "string" ? b.provider : "";
+  const providerLabelCmp = cmp(labels[pa] ?? pa, labels[pb] ?? pb);
+  if (providerLabelCmp !== 0) return providerLabelCmp;
+  if (pa !== pb) return pa < pb ? -1 : 1;
+
+  if (opts.accountCompare) {
+    const acc = opts.accountCompare(a, b);
+    if (acc !== 0) return acc;
+  }
+
+  const accountLabelCmp = cmp(quotaConnLabel(a), quotaConnLabel(b));
+  if (accountLabelCmp !== 0) return accountLabelCmp;
+  const ta = quotaConnTiebreak(a);
+  const tb = quotaConnTiebreak(b);
+  return ta < tb ? -1 : ta > tb ? 1 : 0;
+}
+
+/**
+ * Order provider group keys for rendering. Same provider-level rule as
+ * `compareQuotaConnections` (rank → label → key), used by QuotaCardGrid to
+ * place group headers deterministically.
+ */
+export function compareProviderGroups(
+  a: string,
+  b: string,
+  opts: {
+    providerOrder: Record<string, number>;
+    providerLabels?: Record<string, string>;
+    compare?: (a: string, b: string) => number;
+  }
+): number {
+  const cmp = opts.compare ?? ((x: string, y: string) => x.localeCompare(y));
+  const labels = opts.providerLabels ?? {};
+  const ra = providerRank(a, opts.providerOrder);
+  const rb = providerRank(b, opts.providerOrder);
+  if (ra !== rb) return ra - rb;
+  const labelCmp = cmp(labels[a] ?? a, labels[b] ?? b);
+  if (labelCmp !== 0) return labelCmp;
+  return a < b ? -1 : a > b ? 1 : 0;
 }

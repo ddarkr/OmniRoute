@@ -93,6 +93,8 @@ RTK mode is optimized for verbose tool outputs that appear in coding-agent sessi
   TypeScript/Vite/Webpack builds, ESLint/Biome/Prettier, npm audit/installs, Docker logs, infra
   output, and generic shell output
 - Applies JSON filter packs from `open-sse/services/compression/engines/rtk/filters/`
+- Imports RTK TOML schema v1 filters from project or global `filters.toml` files, with inline-test
+  validation and trust-gating for project files
 - Ships 49 built-in filters with inline verify samples
 - Removes ANSI control sequences, progress bars, repeated lines, and non-actionable noise
 - Preserves failures, errors, warnings, changed files, summaries, and the tail of long output
@@ -144,6 +146,26 @@ That `78-95%` number applies when both RTK and Caveman can reduce the same input
 Caveman response output mode is separate: when enabled, use Caveman's own output savings (`65%`
 average, `~75%` headline, `22-87%` range). Total billing savings depend on your prompt/output mix.
 
+### What "eligible" actually means
+
+The 15-95% headline range is real, but it only applies to **redundant or verbose** content — repeated
+error lines, a build log that spams the same warning, an oversized `grep`/file-read dump. It does
+**not** mean every request saves that much.
+
+Verified empirically (`tests/unit/compression/stacked-compression-tool-result-savings.test.ts`): a
+`stacked` (RTK + Caveman) run against an Anthropic-shape `tool_result` block containing 300 identical
+error lines produced **95.93% token savings / 96.26% character savings** — squarely in the advertised
+range. But the same pipeline run against normal, non-redundant tool output (a clean `grep` match list,
+a short file read, ordinary conversational text) correctly produces **near-zero savings**, because
+there is nothing repetitive to remove and `validateCompression()` (`validation.ts`) refuses to ship a
+rewrite that would drop or alter code blocks, URLs, headings, versions, or `CONST_CASE` identifiers.
+
+This is expected, safe behavior, not a bug: a coding session that mostly reads/greps clean files will
+see modest total savings even with compression fully enabled, while a session that hits a failing
+loop or a chatty linter will see the full 78-95% range on that traffic. Don't use a single session's
+low aggregate savings percentage as evidence compression is misconfigured — check whether the
+underlying tool output was actually redundant first.
+
 ---
 
 ## Token Savings Visualization
@@ -181,12 +203,20 @@ Combo: "free-forever"
   Compression Combo: "coding-agent-stack"
   Pipeline: RTK -> Caveman
   Targets:
-    1. if/kimi-k2-thinking
-    2. qw/qwen3-coder-plus
+    1. if/kimi-k2.7-code
+    2. if/qwen3.8-max-preview
 ```
 
 This lets you use stacked compression on free/coding providers while keeping lite mode on paid
 subscriptions.
+
+This "Per-Combo Override" assignment is a different control from the **routing-combo compression
+mode** override (Default/Off/Lite/Standard/Aggressive/Ultra) — that override does not pick a named
+compression-combo pipeline; it just sets the `compressionMode` field consulted by
+`resolveCompressionPlan`. It can be set either on the combo card (`Dashboard → Combos`) or, since
+#6760, per routing combo in the "Assign to routing" list on
+`Dashboard → Context & Cache → Compression Combos`, right next to the pipeline-assignment checkbox
+documented above. Both surfaces persist through the same `PUT /api/combos/{id}` endpoint.
 
 ### Per-request override
 
@@ -273,12 +303,12 @@ Every compressed request includes stats in the server logs:
 
 ## Phase Roadmap
 
-| Phase   | Modes                                                                | Status     |
-| ------- | -------------------------------------------------------------------- | ---------- |
-| Phase 1 | Off, Lite                                                            | ✅ Shipped |
-| Phase 2 | Standard, Aggressive, Ultra                                          | ✅ Shipped |
-| Phase 3 | RTK, Stacked, Compression Combos                                     | ✅ Shipped |
-| Phase 4 | Output Styles, SLM-tier Ultra, eval harness | ✅ Shipped |
+| Phase    | Modes                                                                                                        | Status                                                                 |
+| -------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Phase 1  | Off, Lite                                                                                                    | ✅ Shipped                                                             |
+| Phase 2  | Standard, Aggressive, Ultra                                                                                  | ✅ Shipped                                                             |
+| Phase 3  | RTK, Stacked, Compression Combos                                                                             | ✅ Shipped                                                             |
+| Phase 4  | Output Styles, SLM-tier Ultra, eval harness                                                                  | ✅ Shipped                                                             |
 | Phase 4C | Adaptive context-budget ("dial") — compute engine + API (`contextBudget` on `PUT /api/settings/compression`) | ✅ Shipped (API-configurable; dashboard controls not yet built, #7005) |
 
 ---

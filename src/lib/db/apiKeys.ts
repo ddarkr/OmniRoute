@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import { getDbInstance, rowToCamel } from "./core";
 import { backupDbFile } from "./backup";
 import { registerDbStateResetter } from "./stateReset";
+import { invalidateReasoningRoutingRuleCache } from "./reasoningRoutingRules";
 import { getKeyGroupsForApiKey, checkKeyModelAccess } from "./apiKeyGroups";
 import { API_KEY_COLUMN_FALLBACKS } from "./apiKeyColumnFallbacks";
 import {
@@ -16,6 +17,7 @@ import {
 } from "./apiKeyUsageLimitFields";
 import { setNoLog } from "../compliance/noLog";
 import { resolveModelAlias } from "@omniroute/open-sse/services/modelDeprecation.ts";
+import { getProviderAlias, resolveProviderId } from "@/shared/constants/providers";
 import { getSyncedAvailableModelsByConnection, getCustomModels, getModelIsHidden } from "./models";
 import {
   CLAUDE_CODE_PROVIDER_PREFIXES,
@@ -23,6 +25,7 @@ import {
   stripExtendedContextSuffix,
   isPotentialUnprefixedClaudeCodeModel,
   addModelCandidate,
+  addProviderAliasScopedCandidates,
   modelPatternMatches,
   hasClaudeCodeWildcardPermission,
   matchesWildcardPattern,
@@ -306,6 +309,15 @@ async function getModelPermissionCandidates(modelId: string): Promise<string[]> 
       addModelCandidate(candidates, `cc/${providerScopedModel}`);
       addModelCandidate(candidates, `claude/${providerScopedModel}`);
     }
+    if (providerScopedModel) {
+      addProviderAliasScopedCandidates(
+        candidates,
+        providerOrAlias,
+        providerScopedModel,
+        resolveProviderId,
+        getProviderAlias
+      );
+    }
     return Array.from(candidates);
   }
 
@@ -427,10 +439,16 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
   };
 }
 
-export async function getApiKeys() {
+export async function getApiKeys(limit?: number, offset?: number) {
   const db = getDbInstance() as ApiKeysDbLike;
-  const stmt = getPreparedStatements(db);
-  const rows = stmt.getAllKeys.all();
+  let rows: ApiKeyRow[];
+  if (limit !== undefined) {
+    const sql = "SELECT * FROM api_keys ORDER BY created_at LIMIT ? OFFSET ?";
+    rows = db.prepare(sql).all(limit, offset ?? 0) as ApiKeyRow[];
+  } else {
+    const stmt = getPreparedStatements(db);
+    rows = stmt.getAllKeys.all();
+  }
   return rows.map((row) => {
     const camelRow = toRecord(rowToCamel(row)) as ApiKeyView;
     camelRow.allowedModels = parseAllowedModels(camelRow.allowedModels);
@@ -460,6 +478,12 @@ export async function getApiKeys() {
   });
 }
 
+export function getApiKeysCount(): number {
+  const db = getDbInstance() as ApiKeysDbLike;
+  const row = db.prepare("SELECT count(*) as cnt FROM api_keys").get() as { cnt: number };
+  return row.cnt;
+}
+
 /**
  * Select an API key for internal OmniRoute operations (combo health checks,
  * cloud-sync verify pings, etc.).
@@ -485,10 +509,7 @@ export async function getApiKeys() {
  * inactive, or banned key, and it never widens a key's allowedModels.
  */
 export async function pickApiKeyForInternalUse(
-  purpose:
-    | "combo-health-check"
-    | "cloud-sync-verify"
-    | "internal-probe" = "internal-probe"
+  purpose: "combo-health-check" | "cloud-sync-verify" | "internal-probe" = "internal-probe"
 ): Promise<string | null> {
   try {
     const keys = (await getApiKeys()) as Array<{
@@ -506,29 +527,23 @@ export async function pickApiKeyForInternalUse(
 
     // 1. Management-scoped key (preferred for any internal probe).
     const manageKey = keys.find(
-      (k) =>
-        isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage"),
+      (k) => isUsable(k) && Array.isArray(k.scopes) && k.scopes.includes("manage")
     );
     if (manageKey?.key) return manageKey.key;
 
     // 2. Allow-all key (empty allowedModels means no model restrictions).
     const allowAllKey = keys.find(
-      (k) =>
-        isUsable(k) &&
-        Array.isArray(k.allowedModels) &&
-        k.allowedModels.length === 0,
+      (k) => isUsable(k) && Array.isArray(k.allowedModels) && k.allowedModels.length === 0
     );
     if (allowAllKey?.key) return allowAllKey.key;
 
     // 3. Most recently used (proxy for "the user actually wants this one
     //    working right now").
-    const byRecency = [...keys]
-      .filter(isUsable)
-      .sort((a, b) => {
-        const aT = typeof a.lastUsedAt === "number" ? a.lastUsedAt : 0;
-        const bT = typeof b.lastUsedAt === "number" ? b.lastUsedAt : 0;
-        return bT - aT;
-      });
+    const byRecency = [...keys].filter(isUsable).sort((a, b) => {
+      const aT = typeof a.lastUsedAt === "number" ? a.lastUsedAt : 0;
+      const bT = typeof b.lastUsedAt === "number" ? b.lastUsedAt : 0;
+      return bT - aT;
+    });
     if (byRecency[0]?.key) return byRecency[0].key;
 
     // 4. Legacy fallback: first active key. Keeps the function working
@@ -1061,6 +1076,7 @@ export async function deleteApiKey(id: string) {
 
   // Invalidate caches since a key was removed
   invalidateCaches();
+  invalidateReasoningRoutingRuleCache();
   await deleteRedisAuthCacheEntry(row?.key_hash);
 
   backupDbFile("pre-write");
@@ -1444,28 +1460,22 @@ export async function isModelAllowedForKey(
     }
   }
 
-  // Empty array means all models allowed
-  if (!allowedModels || allowedModels.length === 0) {
-    return true;
-  }
-
-  let allowed = false;
-
-  // Check if model matches each allowed pattern
   // Support exact match and prefix match (e.g., "openai/*" allows all OpenAI models)
-  for (const pattern of allowedModels) {
-    if (modelPatternMatches(pattern, modelPermissionCandidates)) {
-      allowed = true;
-      break;
-    }
-  }
+  let allowed =
+    !allowedModels ||
+    allowedModels.length === 0 ||
+    allowedModels.some((pattern) => modelPatternMatches(pattern, modelPermissionCandidates));
 
-  // If key belongs to groups, also check group-level permissions
+  // Extract model target and optional provider prefix if present (e.g. "openai/gpt-4" -> modelTarget: "gpt-4", provider: "openai")
+  const hasProviderPrefix = modelId?.includes("/");
+  const provider = hasProviderPrefix ? modelId.split("/")[0] : undefined;
+  const modelTarget = hasProviderPrefix ? modelId.split("/").slice(1).join("/") : modelId || "";
+
+  // If key belongs to groups, check both modelTarget and full modelId against group rules
   if (metadata.id) {
-    const groupAccess = checkKeyModelAccess(metadata.id, modelId || "");
-    if (!groupAccess.allowed) {
-      allowed = false;
-    }
+    const targetOk = checkKeyModelAccess(metadata.id, modelTarget, provider).allowed;
+    const fullOk = checkKeyModelAccess(metadata.id, modelId || "", provider).allowed;
+    if (!targetOk || !fullOk) allowed = false;
   }
   // Cache the result
   if (!usesSettingDependentClaudeRouting) {

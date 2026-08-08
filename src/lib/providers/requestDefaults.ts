@@ -4,6 +4,7 @@ const CLAUDE_CODE_COMPATIBLE_PROVIDER_PREFIX = "anthropic-compatible-cc-";
 import { normalizeExcludedModelPatterns } from "@/domain/connectionModelRules";
 import { normalizeRoutingTags } from "@/domain/tagRouter";
 import { normalizeOpenRouterPreset } from "@/shared/constants/openRouterPreset";
+import { isForbiddenCustomHeaderName } from "@/shared/constants/upstreamHeaders";
 
 export const CODEX_REASONING_EFFORT_VALUES = [
   "none",
@@ -129,6 +130,54 @@ export function normalizeRequestDefaults(
   return Object.keys(normalized).length > 0 ? normalized : undefined;
 }
 
+const CACHE_PASSTHROUGH_VALUES = new Set(["strip", "openai-format", "claude-format"]);
+
+// #6880 — per-connection prompt-cache capability override: strip unknown keys / invalid
+// types, drop the sub-object entirely when nothing valid survives.
+export function normalizeCacheOverride(value: unknown): JsonRecord | undefined {
+  const record = asRecord(value);
+  if (Object.keys(record).length === 0) return undefined;
+
+  const normalized: JsonRecord = {};
+  if (typeof record.supportsPromptCaching === "boolean") {
+    normalized.supportsPromptCaching = record.supportsPromptCaching;
+  }
+  if (
+    typeof record.cacheControlPassthrough === "string" &&
+    CACHE_PASSTHROUGH_VALUES.has(record.cacheControlPassthrough)
+  ) {
+    normalized.cacheControlPassthrough = record.cacheControlPassthrough;
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+// #6880 — extracted so normalizeProviderSpecificData() stays under the
+// max-lines-per-function gate: normalizes the two nested-object sub-fields
+// (requestDefaults, cache) in one pass.
+function normalizeNestedSubObjects(
+  provider: string | null | undefined,
+  normalized: JsonRecord
+): void {
+  if ("requestDefaults" in normalized) {
+    const requestDefaults = normalizeRequestDefaults(provider, normalized.requestDefaults);
+    if (requestDefaults) {
+      normalized.requestDefaults = requestDefaults;
+    } else {
+      delete normalized.requestDefaults;
+    }
+  }
+
+  if ("cache" in normalized) {
+    const cache = normalizeCacheOverride(normalized.cache);
+    if (cache) {
+      normalized.cache = cache;
+    } else {
+      delete normalized.cache;
+    }
+  }
+}
+
 export function normalizeProviderSpecificData(
   provider: string | null | undefined,
   value: unknown
@@ -138,14 +187,7 @@ export function normalizeProviderSpecificData(
 
   const normalized: JsonRecord = { ...record };
 
-  if ("requestDefaults" in normalized) {
-    const requestDefaults = normalizeRequestDefaults(provider, normalized.requestDefaults);
-    if (requestDefaults) {
-      normalized.requestDefaults = requestDefaults;
-    } else {
-      delete normalized.requestDefaults;
-    }
-  }
+  normalizeNestedSubObjects(provider, normalized);
 
   if ("openaiStoreEnabled" in normalized && typeof normalized.openaiStoreEnabled !== "boolean") {
     delete normalized.openaiStoreEnabled;
@@ -214,6 +256,30 @@ export function normalizeProviderSpecificData(
       delete normalized.excludedModels;
     }
     delete normalized.excluded_models;
+  }
+
+  // #8369: connection-level custom upstream headers — sanitize each key against the
+  // forbidden-header denylist and drop entries with non-string or empty values.
+  if ("customHeaders" in normalized) {
+    const raw = normalized.customHeaders;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const cleaned: Record<string, string> = {};
+      for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+        const trimmedKey = key.trim();
+        if (!trimmedKey) continue;
+        if (isForbiddenCustomHeaderName(trimmedKey)) continue;
+        if (typeof value === "string" && value.trim().length > 0) {
+          cleaned[trimmedKey] = value.trim();
+        }
+      }
+      if (Object.keys(cleaned).length > 0) {
+        normalized.customHeaders = cleaned;
+      } else {
+        delete normalized.customHeaders;
+      }
+    } else {
+      delete normalized.customHeaders;
+    }
   }
 
   return Object.keys(normalized).length > 0 ? normalized : undefined;

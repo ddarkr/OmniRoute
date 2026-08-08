@@ -14,6 +14,14 @@ interface AudioModel {
 
 export interface AudioProvider {
   id: string;
+  /**
+   * Provider key to look credentials up under. Dynamic provider nodes are exposed
+   * to callers under their `prefix` (that is what appears in `provider/model`),
+   * but their connections are stored under the node **id** — without this the
+   * credential lookup silently misses. Absent for hardcoded providers, where the
+   * id already is the credential key.
+   */
+  credentialProviderId?: string;
   baseUrl: string;
   authType: string;
   authHeader: string;
@@ -45,6 +53,28 @@ export const AUDIO_TRANSCRIPTION_PROVIDERS: Record<string, AudioProvider> = {
     models: [
       { id: "whisper-1", name: "Whisper 1" },
       { id: "gpt-4o-transcription", name: "GPT-4o Transcription" },
+    ],
+  },
+
+  openrouter: {
+    id: "openrouter",
+    baseUrl: "https://openrouter.ai/api/v1/audio/transcriptions",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "openrouter-stt",
+    supportedFormats: ["wav", "mp3", "flac", "m4a", "ogg", "webm", "aac"],
+    models: [
+      { id: "deepgram/nova-3", name: "Deepgram Nova-3" },
+      { id: "microsoft/mai-transcribe-1.5", name: "Microsoft MAI-Transcribe 1.5" },
+      { id: "nvidia/parakeet-tdt-0.6b-v3", name: "NVIDIA Parakeet TDT 0.6B v3" },
+      { id: "mistralai/voxtral-mini-transcribe", name: "Mistral Voxtral Mini Transcribe" },
+      { id: "qwen/qwen3-asr-flash-2026-02-10", name: "Qwen3 ASR Flash 2026-02-10" },
+      { id: "google/chirp-3", name: "Google Chirp 3" },
+      { id: "openai/gpt-4o-mini-transcribe", name: "OpenAI GPT-4o Mini Transcribe" },
+      { id: "openai/whisper-large-v3", name: "OpenAI Whisper Large v3" },
+      { id: "openai/whisper-large-v3-turbo", name: "OpenAI Whisper Large v3 Turbo" },
+      { id: "openai/whisper-1", name: "OpenAI Whisper 1" },
+      { id: "openai/gpt-4o-transcribe", name: "OpenAI GPT-4o Transcribe" },
     ],
   },
 
@@ -115,6 +145,19 @@ export const AUDIO_TRANSCRIPTION_PROVIDERS: Record<string, AudioProvider> = {
     ],
   },
 
+  soniox: {
+    id: "soniox",
+    baseUrl: "https://api.soniox.com/v1/transcriptions",
+    authType: "apikey",
+    authHeader: "bearer",
+    async: true,
+    format: "soniox",
+    models: [
+      { id: "stt-async-v5", name: "Soniox STT Async v5" },
+      { id: "stt-async-v4", name: "Soniox STT Async v4" },
+    ],
+  },
+
   nvidia: {
     id: "nvidia",
     baseUrl: "https://integrate.api.nvidia.com/v1/audio/transcriptions",
@@ -158,6 +201,51 @@ export const AUDIO_TRANSCRIPTION_PROVIDERS: Record<string, AudioProvider> = {
       { id: "elevenlabs/speech-to-text", name: "ElevenLabs STT" },
       { id: "elevenlabs/audio-isolation", name: "ElevenLabs Audio Isolation" },
     ],
+  },
+
+  gladia: {
+    id: "gladia",
+    // POST https://api.gladia.io/v2/pre-recorded — async workflow: upload → submit → poll
+    // Auth: x-gladia-key: <API_KEY> (custom header, not a standard Bearer/Token scheme)
+    // Free tier: 10 hours/month, no credit card required
+    baseUrl: "https://api.gladia.io/v2/pre-recorded",
+    authType: "apikey",
+    authHeader: "x-gladia-key",
+    async: true,
+    format: "gladia",
+    models: [
+      { id: "solaria-1", name: "Solaria 1" },
+      { id: "solaria-mini", name: "Solaria Mini" },
+    ],
+  },
+
+  "rev-ai": {
+    id: "rev-ai",
+    baseUrl: "https://api.rev.ai/speechtotext/v1",
+    authType: "apikey",
+    authHeader: "bearer",
+    async: true,
+    format: "rev-ai",
+    models: [
+      { id: "machine", name: "Reverb ASR" },
+      { id: "low_cost", name: "Low-Cost ASR" },
+      { id: "fusion", name: "Fusion ASR" },
+    ],
+  },
+
+  speechmatics: {
+    id: "speechmatics",
+    // POST https://asr.api.speechmatics.com/v2/jobs — async batch workflow:
+    // submit multipart job (audio + JSON config) → poll → fetch transcript.
+    // Auth: Authorization: Bearer <api-key>
+    // Free tier: 8 hours/month, no credit card required.
+    // Streaming (WebSocket real-time) mode is out of scope for v1 — batch only.
+    baseUrl: "https://asr.api.speechmatics.com/v2/jobs",
+    authType: "apikey",
+    authHeader: "bearer",
+    async: true,
+    format: "speechmatics",
+    models: [{ id: "enhanced", name: "Enhanced" }],
   },
 };
 
@@ -245,6 +333,15 @@ export const AUDIO_SPEECH_PROVIDERS: Record<string, AudioProvider> = {
     ],
   },
 
+  soniox: {
+    id: "soniox",
+    baseUrl: "https://tts-rt.soniox.com/tts",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "soniox-tts",
+    models: [{ id: "tts-rt-v1", name: "Soniox TTS RT v1" }],
+  },
+
   elevenlabs: {
     id: "elevenlabs",
     baseUrl: "https://api.elevenlabs.io/v1/text-to-speech",
@@ -330,6 +427,22 @@ export const AUDIO_SPEECH_PROVIDERS: Record<string, AudioProvider> = {
     ],
   },
 
+  fishaudio: {
+    id: "fishaudio",
+    // POST https://api.fish.audio/v1/tts
+    // Auth: Authorization: Bearer <api-key>, model as an HTTP header
+    // Response: binary audio bytes
+    baseUrl: "https://api.fish.audio/v1/tts",
+    authType: "apikey",
+    authHeader: "bearer",
+    format: "fishaudio",
+    models: [
+      { id: "s1", name: "Fish Speech S1" },
+      { id: "speech-1.6", name: "Fish Speech 1.6" },
+      { id: "speech-1.5", name: "Fish Speech 1.5" },
+    ],
+  },
+
   playht: {
     id: "playht",
     // POST https://api.play.ht/api/v2/tts/stream
@@ -405,6 +518,45 @@ export const AUDIO_SPEECH_PROVIDERS: Record<string, AudioProvider> = {
     ],
   },
 
+  edgetts: {
+    id: "edgetts",
+    // Microsoft Edge "Read Aloud" — reverse-engineered, no API key required.
+    // WebSocket transport (unlike every other entry here) — handled by
+    // open-sse/executors/edgeTts.ts, dispatched via the "edgetts" format.
+    baseUrl: "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1",
+    authType: "none",
+    authHeader: "none",
+    format: "edgetts",
+    supportedFormats: ["mp3"],
+    models: [
+      { id: "en-US-AriaNeural", name: "Aria (EN-US, Female)" },
+      { id: "en-US-GuyNeural", name: "Guy (EN-US, Male)" },
+      { id: "en-GB-SoniaNeural", name: "Sonia (EN-GB, Female)" },
+      { id: "en-GB-RyanNeural", name: "Ryan (EN-GB, Male)" },
+      { id: "es-ES-ElviraNeural", name: "Elvira (ES-ES, Female)" },
+      { id: "pt-BR-FranciscaNeural", name: "Francisca (PT-BR, Female)" },
+      { id: "pt-BR-AntonioNeural", name: "Antonio (PT-BR, Male)" },
+      { id: "fr-FR-DeniseNeural", name: "Denise (FR-FR, Female)" },
+      { id: "de-DE-KatjaNeural", name: "Katja (DE-DE, Female)" },
+      { id: "ja-JP-NanamiNeural", name: "Nanami (JA-JP, Female)" },
+      { id: "zh-CN-XiaoxiaoNeural", name: "Xiaoxiao (ZH-CN, Female)" },
+    ],
+  },
+
+  gtts: {
+    id: "gtts",
+    // Google Translate TTS — reverse-engineered, no API key required.
+    // POST batchexecute RPC (unlike the deprecated GET /translate_tts) —
+    // handled by open-sse/executors/gtts.ts, dispatched via the "gtts" format.
+    // No official SLA; per-IP rate-limited by Google without notice.
+    baseUrl: "https://translate.google.com/_/TranslateWebserverUi/data/batchexecute",
+    authType: "none",
+    authHeader: "none",
+    format: "gtts",
+    supportedFormats: ["mp3"],
+    models: [{ id: "default", name: "Google Translate TTS (Free)" }],
+  },
+
   "xiaomi-mimo": {
     id: "xiaomi-mimo",
     baseUrl: "https://api.xiaomimimo.com/v1/chat/completions",
@@ -442,27 +594,49 @@ export function getSpeechProvider(providerId: string): AudioProvider | null {
 }
 
 export interface ProviderNodeRow {
+  /** provider_node row id — the key its connections (and credentials) are stored under. */
+  id?: string;
   prefix: string;
   name: string;
   baseUrl: string;
   apiType?: string;
 }
 
+/** Hosts reachable only from the operator's machine/Docker network. */
+function isLoopbackNodeHost(baseUrl: string): boolean {
+  try {
+    const hostname = new URL(baseUrl).hostname;
+    return (
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Build a dynamic AudioProvider from a provider_node DB entry.
- * Only used for local providers (localhost/127.0.0.1) — remote nodes are
- * excluded by the caller to prevent auth bypass and SSRF.
+ *
+ * Loopback nodes keep `authType: "none"` — a local Ollama/LM Studio has no key and
+ * must not be blocked on a missing credential. A remote node is the opposite: it is
+ * only reachable when the operator opted in, and it must present the credential
+ * stored on its connection, so it is built as an api-key provider keyed by the node
+ * id (`credentialProviderId`) rather than by the caller-facing prefix.
  */
 export function buildDynamicAudioProvider(node: ProviderNodeRow, audioPath: string): AudioProvider {
   if (!node.prefix || !node.baseUrl) {
     throw new Error(`Invalid provider_node: missing prefix or baseUrl`);
   }
   const baseUrl = node.baseUrl.replace(/\/+$/, "");
+  const isLocal = isLoopbackNodeHost(node.baseUrl);
   return {
     id: node.prefix,
+    ...(node.id ? { credentialProviderId: node.id } : {}),
     baseUrl: `${baseUrl}${audioPath}`,
-    authType: "none",
-    authHeader: "none",
+    authType: isLocal ? "none" : "apikey",
+    authHeader: isLocal ? "none" : "bearer",
     models: [],
   };
 }

@@ -26,13 +26,33 @@ import { useTranslations } from "next-intl";
 import { useNotificationStore } from "@/store/notificationStore";
 import { isClaudeCodeCompatibleProvider } from "@/shared/constants/providers";
 import type { ConnectionRowConnection } from "../components/ConnectionRow";
+import {
+  connectionBelongsToProviderPage,
+  getProviderConnectionsRequestUrl,
+} from "../../providerPageUtils";
 import { normalizeCodexLimitPolicy } from "../providerPageHelpers";
+import { useProviderQuotaVisibility } from "./useProviderQuotaVisibility";
+import { useReorderByAvailability } from "./useReorderByAvailability";
+import {
+  useConnectionDeleteConfirm,
+  type ConnectionDeleteConfirmState,
+} from "./useConnectionDeleteConfirm";
 
 // Max connection ids accepted per bulk request — mirrors API-side cap.
 const MAX_BULK_IDS = 100;
 const PAGE_SIZE = 50;
 
 // ──── types ─────────────────────────────────────────────────────────────────
+
+/**
+ * Upstream proxy routing mode for Claude-Code-compatible providers. `native`
+ * uses OmniRoute's own executor; `cliproxyapi`/`dario` route every request
+ * through that backend directly; `fallback` tries native first and retries
+ * via `fallbackBackend` on failure. Mirrors the `mode` enum in
+ * src/app/api/upstream-proxy/[providerId]/route.ts.
+ */
+export type UpstreamProxyMode = "native" | "cliproxyapi" | "dario" | "fallback";
+export type UpstreamProxyFallbackBackend = "cliproxyapi" | "dario";
 
 export type BatchTestResults = {
   error: string | null;
@@ -55,22 +75,25 @@ export interface UseProviderConnectionsReturn {
   batchDeleteConfirmOpen: boolean;
   healthFilter: string;
   page: number;
+  accountSearch: string;
   distributingProxies: boolean;
   proxyConfig: any;
   connProxyMap: Record<string, { proxy: any; level: string } | null>;
   cpaProviderEnabled: boolean;
+  upstreamProxyMode: UpstreamProxyMode;
+  upstreamProxyFallbackBackend: UpstreamProxyFallbackBackend;
   refreshingId: string | null;
 
   // Setters (minimal surface for UI)
   setPage: (p: number) => void;
   setHealthFilter: (f: string) => void;
+  setAccountSearch: (q: string) => void;
   setSelectedIds: (updater: Set<string> | ((prev: Set<string>) => Set<string>)) => void;
   setBatchDeleteConfirmOpen: (open: boolean) => void;
   setBatchTestResults: (r: BatchTestResults) => void;
   setConnections: (
     updater:
-      | ConnectionRowConnection[]
-      | ((prev: ConnectionRowConnection[]) => ConnectionRowConnection[])
+      ConnectionRowConnection[] | ((prev: ConnectionRowConnection[]) => ConnectionRowConnection[])
   ) => void;
   setProviderNode: (node: any) => void;
 
@@ -79,12 +102,17 @@ export interface UseProviderConnectionsReturn {
   fetchProxyConfig: () => Promise<void>;
 
   // Single-connection handlers
-  handleDelete: (connectionId: string) => Promise<void>;
+  deleteConfirm: ConnectionDeleteConfirmState;
   handleUpdateConnectionStatus: (id: string, isActive: boolean) => Promise<void>;
   handleToggleRateLimit: (connectionId: string, enabled: boolean) => Promise<void>;
+  handleToggleQuotaVisibility: (connectionId: string, visible: boolean) => Promise<void>;
   handleToggleClaudeExtraUsage: (connectionId: string, enabled: boolean) => Promise<void>;
   handleToggleCodexLimit: (connectionId: string, field: string, enabled: boolean) => Promise<void>;
   handleToggleCliproxyapiMode: (connectionId: string, enabled: boolean) => Promise<void>;
+  handleSetUpstreamProxyMode: (
+    mode: UpstreamProxyMode,
+    fallbackBackend?: UpstreamProxyFallbackBackend
+  ) => Promise<void>;
   handleToggleProxyEnabled: (connectionId: string, proxyEnabled: boolean) => Promise<void>;
   handleTogglePerKeyProxyEnabled: (
     connectionId: string,
@@ -93,6 +121,8 @@ export interface UseProviderConnectionsReturn {
   handleRetestConnection: (connectionId: string) => Promise<void>;
   handleRefreshToken: (connectionId: string) => Promise<void>;
   handleSwapPriority: (conn1: any, conn2: any) => Promise<void>;
+  handleReorderByAvailability: () => Promise<void>;
+  reorderingByAvailability: boolean;
 
   // Batch handlers
   handleBatchSetActive: (isActive: boolean) => Promise<void>;
@@ -128,6 +158,7 @@ export function useProviderConnections(
 
   // ── core state ──────────────────────────────────────────────────────────
   const [connections, setConnections] = useState<ConnectionRowConnection[]>([]);
+  const handleToggleQuotaVisibility = useProviderQuotaVisibility(setConnections, notify, t);
   const [providerNode, setProviderNode] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
@@ -146,6 +177,14 @@ export function useProviderConnections(
   // ── filter / pagination state ───────────────────────────────────────────
   const [healthFilter, setHealthFilter] = useState<string>("all");
   const [page, setPage] = useState(0);
+  // #7937 — account search across the full in-memory connection list. Resets
+  // pagination to page 0 whenever the query text changes (mirrors the
+  // existing setPage(0) on health-filter pill click).
+  const [accountSearch, setAccountSearchRaw] = useState<string>("");
+  const setAccountSearch = useCallback((query: string) => {
+    setAccountSearchRaw(query);
+    setPage(0);
+  }, []);
 
   // ── proxy state ─────────────────────────────────────────────────────────
   const [distributingProxies, setDistributingProxies] = useState(false);
@@ -154,8 +193,14 @@ export function useProviderConnections(
     Record<string, { proxy: any; level: string } | null>
   >({});
 
-  // ── CLIProxyAPI state ───────────────────────────────────────────────────
-  const [cpaProviderEnabled, setCpaProviderEnabled] = useState(false);
+  // ── Upstream proxy routing state (native / CLIProxyAPI / Dario / fallback) ─
+  const [upstreamProxyMode, setUpstreamProxyModeState] = useState<UpstreamProxyMode>("native");
+  const [upstreamProxyFallbackBackend, setUpstreamProxyFallbackBackendState] =
+    useState<UpstreamProxyFallbackBackend>("cliproxyapi");
+  // Legacy derived flag — kept for any consumer still reading a plain
+  // enabled/disabled signal instead of the full mode.
+  const cpaProviderEnabled =
+    upstreamProxyMode === "cliproxyapi" || upstreamProxyMode === "fallback";
 
   // ── token refresh state ─────────────────────────────────────────────────
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
@@ -179,15 +224,16 @@ export function useProviderConnections(
 
   const fetchConnections = useCallback(async () => {
     try {
+      const connectionsUrl = getProviderConnectionsRequestUrl(providerId);
       const [connectionsRes, nodesRes] = await Promise.all([
-        fetch("/api/providers", { cache: "no-store" }),
+        fetch(connectionsUrl, { cache: "no-store" }),
         fetch("/api/provider-nodes", { cache: "no-store" }),
       ]);
       const connectionsData = await connectionsRes.json();
       const nodesData = await nodesRes.json();
       if (connectionsRes.ok) {
-        const filtered = (connectionsData.connections || []).filter(
-          (c: any) => c.provider === providerId
+        const filtered = (connectionsData.connections || []).filter((c: any) =>
+          connectionBelongsToProviderPage(c.provider, providerId)
         );
         setConnections(filtered);
       }
@@ -252,26 +298,21 @@ export function useProviderConnections(
     }
   }, [loading, connections, loadConnProxies]);
 
-  // CLIProxyAPI upstream proxy config
+  // Upstream proxy routing config (native / CLIProxyAPI / Dario / fallback)
   useEffect(() => {
     if (!isCcCompatible) return;
 
-    fetch(`/api/settings`)
-      .then((r) => r.json())
-      .then(() => {
-        // Check if this provider has CLIProxyAPI routing enabled
-      })
-      .catch(() => {});
-
     fetch(`/api/upstream-proxy/${providerId}`)
-      .then((r) => {
-        if (!r.ok) return null;
-        return r.json();
-      })
+      .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (data?.enabled && (data.mode === "cliproxyapi" || data.mode === "fallback")) {
-          setCpaProviderEnabled(true);
-        }
+        if (!data) return;
+        const validModes: UpstreamProxyMode[] = ["cliproxyapi", "dario", "fallback"];
+        const mode: UpstreamProxyMode =
+          data.enabled && validModes.includes(data.mode) ? data.mode : "native";
+        setUpstreamProxyModeState(mode);
+        setUpstreamProxyFallbackBackendState(
+          data.fallbackBackend === "dario" ? "dario" : "cliproxyapi"
+        );
       })
       .catch(() => {});
   }, [isCcCompatible, providerId]);
@@ -304,29 +345,7 @@ export function useProviderConnections(
   // Single-connection handlers
   // ────────────────────────────────────────────────────────────────────────
 
-  const handleDelete = useCallback(
-    async (connectionId: string) => {
-      if (!connectionId) return;
-      try {
-        const res = await fetch(`/api/providers/${connectionId}`, { method: "DELETE" });
-        if (res.ok) {
-          notify.success("Connection deleted");
-          await fetchConnections();
-        } else {
-          const data = await res.json().catch(() => ({}));
-          const message =
-            (typeof data?.error === "string" && data.error) ||
-            data?.error?.message ||
-            "Failed to delete connection";
-          notify.error(message);
-        }
-      } catch (error) {
-        console.error("Error deleting connection:", error);
-        notify.error("Failed to delete connection");
-      }
-    },
-    [fetchConnections, notify]
-  );
+  const deleteConfirm = useConnectionDeleteConfirm(fetchConnections, notify);
 
   const handleUpdateConnectionStatus = async (id: string, isActive: boolean) => {
     try {
@@ -473,29 +492,50 @@ export function useProviderConnections(
     }
   };
 
-  const handleToggleCliproxyapiMode = async (_connectionId: string, enabled: boolean) => {
+  const UPSTREAM_PROXY_MODE_MESSAGES: Record<UpstreamProxyMode, string> = {
+    native: "Requests now use native OmniRoute (direct)",
+    cliproxyapi: "Requests now route through CLIProxyAPI (deeper emulation)",
+    dario: "Requests now route through Dario (Claude subscription proxy)",
+    fallback: "Requests try native first, retrying via the configured backend on failure",
+  };
+
+  const handleSetUpstreamProxyMode = async (
+    mode: UpstreamProxyMode,
+    fallbackBackend?: UpstreamProxyFallbackBackend
+  ) => {
     try {
       const res = await fetch(`/api/upstream-proxy/${providerId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: enabled ? "cliproxyapi" : "native", enabled }),
+        body: JSON.stringify({
+          mode,
+          enabled: mode !== "native",
+          ...(mode === "fallback"
+            ? { fallbackBackend: fallbackBackend ?? upstreamProxyFallbackBackend }
+            : {}),
+        }),
       });
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        notify.error(data.error || "Failed to update CLIProxyAPI routing");
+        notify.error(data.error || "Failed to update upstream proxy routing");
         return;
       }
 
-      setCpaProviderEnabled(enabled);
-      notify.success(
-        enabled
-          ? "Requests now route through CLIProxyAPI (deeper emulation)"
-          : "Requests now use native OmniRoute (direct)"
-      );
+      setUpstreamProxyModeState(mode);
+      if (mode === "fallback" && fallbackBackend) {
+        setUpstreamProxyFallbackBackendState(fallbackBackend);
+      }
+      notify.success(UPSTREAM_PROXY_MODE_MESSAGES[mode]);
     } catch {
-      notify.error("Failed to update CLIProxyAPI routing");
+      notify.error("Failed to update upstream proxy routing");
     }
+  };
+
+  // Legacy binary wrapper — kept so existing callers (and the "exposes all
+  // expected handler functions" hook test) keep working unchanged.
+  const handleToggleCliproxyapiMode = async (_connectionId: string, enabled: boolean) => {
+    await handleSetUpstreamProxyMode(enabled ? "cliproxyapi" : "native");
   };
 
   const handleToggleProxyEnabled = async (connectionId: string, proxyEnabled: boolean) => {
@@ -606,6 +646,16 @@ export function useProviderConnections(
       console.log("Error swapping priority:", error);
     }
   };
+
+  // Reorder-by-availability toolbar action — extracted to its own hook
+  // (see useReorderByAvailability.ts) to keep this file under the file-size cap.
+  const { reorderingByAvailability, handleReorderByAvailability } = useReorderByAvailability({
+    connections,
+    setConnections,
+    fetchConnections,
+    notify,
+    t,
+  });
 
   // ────────────────────────────────────────────────────────────────────────
   // Selection handlers
@@ -875,15 +925,20 @@ export function useProviderConnections(
     batchDeleteConfirmOpen,
     healthFilter,
     page,
+    accountSearch,
     distributingProxies,
     proxyConfig,
     connProxyMap,
     cpaProviderEnabled,
+    upstreamProxyMode,
+    upstreamProxyFallbackBackend,
     refreshingId,
+    reorderingByAvailability,
 
     // Setters
     setPage,
     setHealthFilter,
+    setAccountSearch,
     setSelectedIds,
     setBatchDeleteConfirmOpen,
     setBatchTestResults,
@@ -895,17 +950,20 @@ export function useProviderConnections(
     fetchProxyConfig,
 
     // Single-connection handlers
-    handleDelete,
+    deleteConfirm,
     handleUpdateConnectionStatus,
     handleToggleRateLimit,
+    handleToggleQuotaVisibility,
     handleToggleClaudeExtraUsage,
     handleToggleCodexLimit,
     handleToggleCliproxyapiMode,
+    handleSetUpstreamProxyMode,
     handleToggleProxyEnabled,
     handleTogglePerKeyProxyEnabled,
     handleRetestConnection,
     handleRefreshToken,
     handleSwapPriority,
+    handleReorderByAvailability,
 
     // Batch handlers
     handleBatchSetActive,

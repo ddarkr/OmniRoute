@@ -9,9 +9,11 @@ import {
   tryOpenSync,
   getSqlJsAdapter,
   preInitSqlJs,
+  getSqlJsPreInitError,
   openDatabaseAsync,
 } from "./adapters/driverFactory";
 import path from "path";
+import { retryProbeIfTransient } from "./probeUtils";
 import fs from "fs";
 import { resolveWritableDataDir, getLegacyDotDataDir } from "../dataPaths";
 import { runMigrations } from "./migrationRunner";
@@ -35,10 +37,12 @@ import {
 import { migrateLegacyEncryptedString } from "./encryption";
 import { invalidateDbCache } from "./readCache";
 import { rowToCamel } from "./caseMapping";
+import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 // Re-exported so existing call sites that pull these helpers off the core module keep working.
 export { toSnakeCase, toCamelCase, objToSnake, rowToCamel, cleanNulls } from "./caseMapping";
 import {
   ensureProviderConnectionsColumns,
+  ensureUsageHistoryAccountIndex,
   ensureUsageHistoryColumns,
   ensureCallLogsColumns,
   hasTable,
@@ -155,6 +159,23 @@ function getErrorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+/**
+ * Closes a probe/throwaway connection obtained from `openSqliteDatabase()` —
+ * but ONLY when it is safe to do so. better-sqlite3/node:sqlite hand back an
+ * independent handle per open() call, so closing a probe never affects a
+ * later "real" connection to the same file. sql.js has no such notion: its
+ * fallback path (`getSqlJsAdapter()`) always returns the SAME module-global
+ * cached singleton for a given filePath, so closing "the probe" closes the
+ * ONLY connection that file will ever get until process restart — every
+ * subsequent query (including the "real" connection opened right after)
+ * throws sql.js's raw "Database closed" string (#7494). Skip the close for
+ * sql.js and let the same live adapter flow through untouched.
+ */
+export function closeProbeIfSafe(adapter: SqliteDatabase | null | undefined): void {
+  if (!adapter || adapter.driver === "sql.js") return;
+  if (adapter.open) adapter.close();
+}
+
 function openSqliteDatabase(sqliteFile: string, options?: Record<string, unknown>): SqliteDatabase {
   const adapter = tryOpenSync(sqliteFile, options);
   if (adapter) return adapter;
@@ -162,10 +183,25 @@ function openSqliteDatabase(sqliteFile: string, options?: Record<string, unknown
   const sqlJs = getSqlJsAdapter(sqliteFile);
   if (sqlJs) return sqlJs;
 
+  // sql.js pre-init was genuinely attempted (e.g. by the top-level eager
+  // barrier below) and failed — surface the real cause instead of the
+  // generic/misleading "not pre-initialized yet" message (#7288).
+  const preInitError = getSqlJsPreInitError(sqliteFile);
+  const syncDrivers = process.versions.bun
+    ? "bun:sqlite (failed)"
+    : "better-sqlite3 (failed), node:sqlite (unavailable)";
+  if (preInitError) {
+    throw new Error(
+      `[DB] Nenhum driver SQLite disponível para '${sqliteFile}'. ` +
+        `Drivers testados: ${syncDrivers}, ` +
+        `sql.js (falhou: ${preInitError}).`
+    );
+  }
+
   throw new Error(
     `[DB] Nenhum driver SQLite disponível para '${sqliteFile}'. ` +
       "Chame ensureDbInitialized() no startup. " +
-      "Drivers testados: better-sqlite3 (falhou), node:sqlite (indisponível). " +
+      `Drivers testados: ${syncDrivers}. ` +
       "sql.js WASM ainda não foi pré-inicializado."
   );
 }
@@ -227,6 +263,7 @@ const SCHEMA_SQL = `
     max_concurrent INTEGER,
     proxy_enabled INTEGER NOT NULL DEFAULT 1,
     per_key_proxy_enabled INTEGER NOT NULL DEFAULT 0,
+    quota_visible INTEGER NOT NULL DEFAULT 1,
     quota_window_thresholds_json TEXT,
     rate_limit_overrides_json TEXT,
     created_at TEXT NOT NULL,
@@ -287,6 +324,9 @@ const SCHEMA_SQL = `
     provider TEXT,
     model TEXT,
     connection_id TEXT,
+    account_key TEXT,
+    account_label TEXT,
+    account_label_priority INTEGER DEFAULT 0,
     api_key_id TEXT,
     api_key_name TEXT,
     tokens_input INTEGER DEFAULT 0,
@@ -582,7 +622,7 @@ function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
     return snapshot;
   } finally {
     try {
-      probe?.close();
+      closeProbeIfSafe(probe);
     } catch {
       /* ignore */
     }
@@ -795,15 +835,6 @@ function offloadLegacyCallLogDetails(db: SqliteDatabase) {
   }
 }
 
-function isAutomatedTestProcess(): boolean {
-  return (
-    typeof process !== "undefined" &&
-    (process.env.NODE_ENV === "test" ||
-      process.env.VITEST !== undefined ||
-      process.argv.some((arg) => arg.includes("test")))
-  );
-}
-
 function shouldRunStartupDbHealthCheck(): boolean {
   if (process.env.OMNIROUTE_FORCE_DB_HEALTHCHECK === "1") return true;
   return !isAutomatedTestProcess();
@@ -951,6 +982,7 @@ export function getDbInstance(): SqliteDatabase {
     memoryDb.pragma("journal_mode = WAL");
     memoryDb.exec(SCHEMA_SQL);
     ensureUsageHistoryColumns(memoryDb);
+    ensureUsageHistoryAccountIndex(memoryDb);
     ensureCallLogsColumns(memoryDb);
     ensureProviderConnectionsColumns(memoryDb);
     setDb(memoryDb);
@@ -1028,13 +1060,12 @@ export function getDbInstance(): SqliteDatabase {
         let hasData = false;
         try {
           const count = probe.prepare("SELECT COUNT(*) as c FROM provider_connections").get() as
-            | { c: number }
-            | undefined;
+            { c: number } | undefined;
           hasData = Boolean(count && count.c > 0);
         } catch {
           // Table might not exist at all — truly incompatible
         }
-        probe.close();
+        closeProbeIfSafe(probe);
 
         if (hasData) {
           console.log(
@@ -1048,7 +1079,7 @@ export function getDbInstance(): SqliteDatabase {
             const message = e instanceof Error ? e.message : String(e);
             console.warn("[DB] Could not clean up old schema table:", message);
           } finally {
-            fixDb.close();
+            closeProbeIfSafe(fixDb);
           }
         } else {
           const oldPath = sqliteFile + ".old-schema";
@@ -1065,7 +1096,7 @@ export function getDbInstance(): SqliteDatabase {
           }
         }
       } else {
-        probe.close();
+        closeProbeIfSafe(probe);
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
@@ -1083,7 +1114,11 @@ export function getDbInstance(): SqliteDatabase {
       // V8 heap (sql.js loads the whole file into WASM memory). Throwing
       // immediately gives the user a clear "increase --max-old-space-size"
       // signal instead of silently renaming a perfectly good DB.
-      if (/out of memory|allocation failure|Array buffer allocation failed|allocation failed/i.test(message)) {
+      if (
+        /out of memory|allocation failure|Array buffer allocation failed|allocation failed/i.test(
+          message
+        )
+      ) {
         // Cycle-breaker (#6835): the OOM path never renames the file away,
         // so it never trips the generic probe-failed/restore cap above. Cap
         // it independently after 3 consecutive OOM failures (same threshold
@@ -1108,18 +1143,19 @@ export function getDbInstance(): SqliteDatabase {
             `Original error: ${message}`
         );
       }
-      preservedCriticalState = captureCriticalDbState(sqliteFile);
-
-      // SAFETY: Never delete the database — rename to backup so data can be recovered.
-      // The old code would silently destroy all user data on any probe failure.
-      const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;
-      try {
-        fs.renameSync(sqliteFile, failedPath);
-        console.warn(`[DB] Renamed corrupt DB to ${path.basename(failedPath)}`);
-        failedProbePath = failedPath;
-        failedProbeMessage = message;
-      } catch {
-        /* ok */
+      if (!retryProbeIfTransient(sqliteFile, e, openSqliteDatabase, closeProbeIfSafe)) {
+        preservedCriticalState = captureCriticalDbState(sqliteFile);
+        // SAFETY: Never delete the database — rename to backup so data can be recovered.
+        // The old code would silently destroy all user data on any probe failure.
+        const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;
+        try {
+          fs.renameSync(sqliteFile, failedPath);
+          console.warn(`[DB] Renamed corrupt DB to ${path.basename(failedPath)}`);
+          failedProbePath = failedPath;
+          failedProbeMessage = message;
+        } catch {
+          /* ok */
+        }
       }
     }
   }
@@ -1150,6 +1186,7 @@ export function getDbInstance(): SqliteDatabase {
   db.pragma("busy_timeout = 2000");
   db.pragma("synchronous = NORMAL");
   db.pragma(`cache_size = -${DEFAULT_DATABASE_SETTINGS.optimization.cacheSize}`);
+  db.pragma("temp_store = MEMORY");
   db.exec(SCHEMA_SQL);
   ensureProviderConnectionsColumns(db);
   ensureUsageHistoryColumns(db);
@@ -1169,8 +1206,24 @@ export function getDbInstance(): SqliteDatabase {
   `);
 
   runMigrations(db, { isNewDb });
+  // Fresh installs need the same post-migration index guarantee as upgraded
+  // databases, including recovery from an interrupted migration 127 attempt.
+  ensureUsageHistoryAccountIndex(db);
 
   applyStoredDatabaseOptimizationSettings(db);
+
+  // Apply mmap_size from stored settings (migration 046), fallback to 256MiB
+  try {
+    const mmapRow = db
+      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+      .get("databaseSettings", "mmapSize") as { value: string } | undefined;
+    const mmapSize = mmapRow ? Math.max(0, parseInt(mmapRow.value, 10) || 0) : 268435456;
+    if (mmapSize > 0) {
+      db.pragma(`mmap_size = ${mmapSize}`);
+    }
+  } catch {
+    // mmap_size is best-effort; not available in all runtimes (e.g. web)
+  }
 
   offloadLegacyCallLogDetails(db);
 
@@ -1190,7 +1243,7 @@ export function getDbInstance(): SqliteDatabase {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       try {
-        if (db.open) db.close();
+        closeProbeIfSafe(db);
       } catch {
         /* ignore */
       }
@@ -1297,6 +1350,10 @@ export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | nu
  */
 export function resetDbInstance() {
   closeDbInstance();
+  // Read caches outlive the SQLite singleton. A reset swaps the backing
+  // database, so retaining cached rows can leak the previous database's
+  // connections/settings into the newly opened instance (tests and restore).
+  invalidateDbCache();
 }
 
 // ──────────────── Runtime Driver Info ────────────────

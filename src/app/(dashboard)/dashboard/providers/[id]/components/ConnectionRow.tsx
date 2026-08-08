@@ -16,6 +16,8 @@ import {
   type CodexGlobalServiceMode,
 } from "@/lib/providers/codexFastTier";
 import { normalizeCodexLimitPolicy, providerText, ERROR_TYPE_LABELS } from "../providerPageHelpers";
+import { getCodexPlanLabel } from "../codexPlanLabel";
+import ProviderQuotaVisibilityToggle from "./ProviderQuotaVisibilityToggle";
 
 // ---------------------------------------------------------------------------
 // Types (exported so the client can reference them without re-importing)
@@ -23,6 +25,7 @@ import { normalizeCodexLimitPolicy, providerText, ERROR_TYPE_LABELS } from "../p
 
 export interface ConnectionRowConnection {
   id?: string;
+  provider?: string;
   name?: string;
   email?: string;
   displayName?: string;
@@ -43,6 +46,7 @@ export interface ConnectionRowConnection {
   authType?: string;
   proxyEnabled?: boolean;
   perKeyProxyEnabled?: boolean;
+  quotaVisible?: boolean;
 }
 
 export interface ConnectionRowProps {
@@ -59,12 +63,21 @@ export interface ConnectionRowProps {
   onMoveDown: () => void;
   onToggleActive: (isActive?: boolean) => void | Promise<void>;
   onToggleRateLimit: (enabled?: boolean) => void;
+  onToggleQuotaVisibility?: (visible: boolean) => void;
   onToggleClaudeExtraUsage?: (enabled?: boolean) => void;
+  onToggleAutoSync?: (enabled: boolean) => void;
   onToggleCodex5h?: (enabled?: boolean) => void;
   onToggleCodexWeekly?: (enabled?: boolean) => void;
   isCcCompatible?: boolean;
   cliproxyapiEnabled?: boolean;
   onToggleCliproxyapiMode?: (enabled?: boolean) => void;
+  /** Provider-level upstream proxy routing mode (native/CLIProxyAPI/Dario/fallback). */
+  upstreamProxyMode?: "native" | "cliproxyapi" | "dario" | "fallback";
+  upstreamProxyFallbackBackend?: "cliproxyapi" | "dario";
+  onSetUpstreamProxyMode?: (
+    mode: "native" | "cliproxyapi" | "dario" | "fallback",
+    fallbackBackend?: "cliproxyapi" | "dario"
+  ) => void;
   onRetest: () => void;
   isRetesting?: boolean;
   onEdit: () => void;
@@ -74,6 +87,7 @@ export interface ConnectionRowProps {
   hasProxy?: boolean;
   proxySource?: string;
   proxyHost?: string;
+  proxyName?: string | null;
   proxyEnabled?: boolean;
   perKeyProxyEnabled?: boolean;
   onToggleProxyEnabled?: (enabled: boolean) => void;
@@ -334,6 +348,9 @@ export default function ConnectionRow({
   codexGlobalServiceMode,
   isCcCompatible,
   cliproxyapiEnabled,
+  upstreamProxyMode,
+  upstreamProxyFallbackBackend,
+  onSetUpstreamProxyMode,
   isFirst,
   isLast,
   isSelected,
@@ -342,7 +359,9 @@ export default function ConnectionRow({
   onMoveDown,
   onToggleActive,
   onToggleRateLimit,
+  onToggleQuotaVisibility,
   onToggleClaudeExtraUsage,
+  onToggleAutoSync,
   onToggleCodex5h,
   onToggleCodexWeekly,
   onToggleCliproxyapiMode,
@@ -355,6 +374,7 @@ export default function ConnectionRow({
   hasProxy,
   proxySource,
   proxyHost,
+  proxyName,
   onRefreshToken,
   isRefreshing,
   onApplyCodexAuthLocal,
@@ -442,6 +462,7 @@ export default function ConnectionRow({
 
   const statusPresentation = getStatusPresentation(connection, effectiveStatus, isCooldown, t);
   const rateLimitEnabled = !!connection.rateLimitProtection;
+  const quotaVisible = connection.quotaVisible !== false;
   const codexPolicy =
     connection.providerSpecificData &&
     typeof connection.providerSpecificData === "object" &&
@@ -499,7 +520,14 @@ export default function ConnectionRow({
   const claudeBlockExtraUsageEnabled = isClaude
     ? isClaudeExtraUsageBlockEnabled("claude", connection.providerSpecificData)
     : false;
-  const cliproxyapiDeepMode = !!cliproxyapiEnabled;
+  const codexPlanLabel = getCodexPlanLabel(!!isCodex, connection.providerSpecificData);
+  // #dario: this control is now a full mode selector (native/CLIProxyAPI/
+  // Dario/fallback), not a binary toggle — cliproxyapiEnabled/
+  // onToggleCliproxyapiMode are kept on the props interface for any other
+  // consumer but are no longer read here.
+  const effectiveUpstreamProxyMode = upstreamProxyMode ?? "native";
+  const autoSyncEnabled = !!(connection.providerSpecificData as Record<string, unknown> | undefined)
+    ?.autoSync;
 
   return (
     <div
@@ -540,6 +568,11 @@ export default function ConnectionRow({
             <Badge variant={statusPresentation.statusVariant as any} size="sm" dot>
               {statusPresentation.statusLabel}
             </Badge>
+            {codexPlanLabel && (
+              <Badge variant="primary" size="sm" className="capitalize">
+                {codexPlanLabel}
+              </Badge>
+            )}
             {/* T12: Token expiry status indicator (state-driven, no Date.now in render) */}
             {/* #5836: the red "Token Expired" badge is TERMINAL-only — for OAuth
                refresh-capable providers (Antigravity/Gemini) the access token lapses
@@ -612,6 +645,30 @@ export default function ConnectionRow({
               <span className="material-symbols-outlined text-[13px]">shield</span>
               {rateLimitEnabled ? t("rateLimitProtected") : t("rateLimitUnprotected")}
             </button>
+            {onToggleQuotaVisibility && (
+              <ProviderQuotaVisibilityToggle
+                visible={quotaVisible}
+                onToggle={onToggleQuotaVisibility}
+              />
+            )}
+            {onToggleAutoSync && (
+              <>
+                <span className="text-text-muted/30 select-none">|</span>
+                <button
+                  onClick={() => onToggleAutoSync?.(!autoSyncEnabled)}
+                  disabled={connection.isActive === false}
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+                    autoSyncEnabled
+                      ? "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25"
+                      : "bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/50 hover:text-text-muted hover:bg-black/[0.06] dark:hover:bg-white/[0.06]"
+                  }`}
+                  title={t("autoSyncTooltip")}
+                >
+                  <span className="material-symbols-outlined text-[13px]">sync</span>
+                  {t("autoSyncShort")}
+                </button>
+              </>
+            )}
             {isClaude && (
               <>
                 <span className="text-text-muted/30 select-none">|</span>
@@ -630,21 +687,47 @@ export default function ConnectionRow({
                 </button>
               </>
             )}
-            {isCcCompatible && (
+            {/* #dario: upstream proxy routing selector. Gated on isClaude (the
+                real, built-in "claude" provider — the primary intended use
+                case for CLIProxyAPI/Dario failover) OR isCcCompatible (a
+                custom Claude-Code-protocol-compatible node). Previously this
+                only checked isCcCompatible, which never covered the built-in
+                Claude provider at all — the control was unreachable for the
+                one connection type it was actually built for. */}
+            {(isClaude || isCcCompatible) && (
               <>
                 <span className="text-text-muted/30 select-none">|</span>
-                <button
-                  onClick={() => onToggleCliproxyapiMode?.(!cliproxyapiDeepMode)}
-                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-medium transition-all cursor-pointer ${
-                    cliproxyapiDeepMode
-                      ? "bg-indigo-500/15 text-indigo-500 hover:bg-indigo-500/25"
-                      : "bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/50 hover:text-text-muted hover:bg-black/[0.06] dark:hover:bg-white/[0.06]"
-                  }`}
-                  title={cliproxyapiDeepMode ? t("cpaModeEnabledTitle") : t("cpaModeDisabledTitle")}
+                <select
+                  value={effectiveUpstreamProxyMode}
+                  onChange={(e) =>
+                    onSetUpstreamProxyMode?.(
+                      e.target.value as "native" | "cliproxyapi" | "dario" | "fallback"
+                    )
+                  }
+                  className="text-xs font-medium rounded px-1.5 py-0.5 border-0 bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/70 hover:text-text-muted cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30"
+                  title="Upstream proxy routing for Claude Code traffic"
                 >
-                  <span className="material-symbols-outlined text-[13px]">swap_horiz</span>
-                  CPA {cliproxyapiDeepMode ? t("toggleOnShort") : t("toggleOffShort")}
-                </button>
+                  <option value="native">Native</option>
+                  <option value="cliproxyapi">CLIProxyAPI</option>
+                  <option value="dario">Dario</option>
+                  <option value="fallback">Fallback</option>
+                </select>
+                {effectiveUpstreamProxyMode === "fallback" && (
+                  <select
+                    value={upstreamProxyFallbackBackend ?? "cliproxyapi"}
+                    onChange={(e) =>
+                      onSetUpstreamProxyMode?.(
+                        "fallback",
+                        e.target.value as "cliproxyapi" | "dario"
+                      )
+                    }
+                    className="text-xs font-medium rounded px-1.5 py-0.5 border-0 bg-black/[0.03] dark:bg-white/[0.03] text-text-muted/70 hover:text-text-muted cursor-pointer focus:outline-none focus:ring-1 focus:ring-primary/30"
+                    title="Fallback retry backend"
+                  >
+                    <option value="cliproxyapi">→ CLIProxyAPI</option>
+                    <option value="dario">→ Dario</option>
+                  </select>
+                )}
               </>
             )}
             {isCodex && (
@@ -760,7 +843,7 @@ export default function ConnectionRow({
                       })}
                     >
                       <span className="material-symbols-outlined text-[13px]">vpn_lock</span>
-                      {proxyHost || t("proxy")}
+                      {proxyName || proxyHost || t("proxy")}
                     </span>
                   </>
                 );
@@ -858,7 +941,7 @@ export default function ConnectionRow({
           onChange={onToggleActive}
           title={(connection.isActive ?? true) ? t("disableConnection") : t("enableConnection")}
         />
-        <div className="flex gap-1 ml-1 transition-opacity">
+        <div className="flex gap-1 ms-1 transition-opacity">
           {onReauth && (
             <button
               onClick={onReauth}

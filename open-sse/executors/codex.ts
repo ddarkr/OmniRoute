@@ -17,7 +17,8 @@ import {
   CODEX_CHAT_DEFAULT_INSTRUCTIONS,
   CODEX_DEFAULT_INSTRUCTIONS,
 } from "../config/codexInstructions.ts";
-import { HTTP_STATUS, PROVIDERS } from "../config/constants.ts";
+import { FETCH_BODY_TIMEOUT_MS, HTTP_STATUS, PROVIDERS } from "../config/constants.ts";
+import { readCodexPeekChunk, buildCodexTimeoutSafePassthroughBody } from "./codex/bodyTimeout.ts";
 import {
   getCodexClientVersion,
   getCodexUserAgent,
@@ -47,6 +48,12 @@ export {
   getCodexDualWindowCooldownMs,
 } from "./codex/quota.ts";
 import { isCodexFreePlan, normalizeCodexTools } from "./codex/tools.ts";
+import {
+  CODEX_EFFORT_ORDER as EFFORT_ORDER,
+  GPT_5_6_ULTRA_ALIAS_MODELS,
+  splitCodexReasoningSuffix,
+  type CodexEffortLevel as EffortLevel,
+} from "./codex/reasoningSuffix.ts";
 // Re-exported for external importers (tests + provider services).
 export { isCodexFreePlan, normalizeCodexTools } from "./codex/tools.ts";
 
@@ -116,39 +123,66 @@ function codexWebSocketUnavailableResponse(): Response {
 // Ref: sub2api PR #1129 (feat(openai): split codex spark rate limiting from codex)
 export { getCodexModelScope, getCodexRateLimitKey, type CodexQuotaScope };
 
-// Ordered list of effort levels from lowest to highest
-const EFFORT_ORDER = ["none", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
-type EffortLevel = (typeof EFFORT_ORDER)[number];
-const STANDARD_EFFORT_SUFFIXES = ["none", "low", "medium", "high", "xhigh"] as const;
-const GPT_5_6_MAX_ALIAS_MODELS = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-const GPT_5_6_ULTRA_ALIAS_MODELS = new Set(["gpt-5.6-sol", "gpt-5.6-terra"]);
 const CODEX_FAST_WIRE_VALUE = "priority";
 const CODEX_RESPONSES_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
+const CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite";
+const CODEX_RESPONSES_LITE_WS_METADATA_KEY =
+  "ws_request_header_x_openai_internal_codex_responses_lite";
 
-function splitCodexReasoningSuffix(model: unknown): {
-  baseModel: string;
-  effort: EffortLevel | null;
-} {
-  const modelId = typeof model === "string" ? model : "";
-  const gpt56AliasMatch = /^(gpt-5\.6-(?:sol|terra|luna))-(max|ultra)$/.exec(modelId);
-  if (gpt56AliasMatch) {
-    const [, baseModel, alias] = gpt56AliasMatch;
-    const supportedModels =
-      alias === "ultra" ? GPT_5_6_ULTRA_ALIAS_MODELS : GPT_5_6_MAX_ALIAS_MODELS;
-    if (supportedModels.has(baseModel)) {
-      return { baseModel, effort: alias as EffortLevel };
-    }
+// The official Codex client marks Responses Lite over an HTTP header or, for WebSocket
+// requests, mirrors the same signal into client_metadata. Lite rejects parallel tool calls.
+function isEnabledResponsesLiteFlag(value: unknown): boolean {
+  return value === true || (typeof value === "string" && value.trim().toLowerCase() === "true");
+}
+
+function isCodexResponsesLiteRequest(
+  bodyInput: unknown,
+  clientHeaders?: Record<string, string> | null
+): boolean {
+  const hasLiteHeader = Object.entries(clientHeaders ?? {}).some(
+    ([key, value]) =>
+      key.toLowerCase() === CODEX_RESPONSES_LITE_HEADER && isEnabledResponsesLiteFlag(value)
+  );
+  if (hasLiteHeader) return true;
+
+  if (!bodyInput || typeof bodyInput !== "object" || Array.isArray(bodyInput)) return false;
+  const metadata = (bodyInput as Record<string, unknown>).client_metadata;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+
+  return isEnabledResponsesLiteFlag(
+    (metadata as Record<string, unknown>)[CODEX_RESPONSES_LITE_WS_METADATA_KEY]
+  );
+}
+
+// GPT-5.6 ultra-tier (sol/terra at "ultra") and luna at "max" coordinate delegation to
+// sub-agents via parallel tool calls (see the effort-clamp comment near clampEffort()).
+// Responses Lite must not strip parallel_tool_calls for those model/effort combos, or
+// delegation silently breaks while the request still returns HTTP 200 (issue #7821).
+function isCodexDelegationDependentModel(model: unknown): boolean {
+  const { baseModel, effort } = splitCodexReasoningSuffix(model);
+  if (effort === "ultra" && GPT_5_6_ULTRA_ALIAS_MODELS.has(baseModel)) return true;
+  if (effort === "max" && baseModel === "gpt-5.6-luna") return true;
+  return false;
+}
+
+function enforceCodexResponsesLiteParallelToolCalls(
+  bodyInput: unknown,
+  clientHeaders: Record<string, string> | null | undefined,
+  model: unknown
+): unknown {
+  if (
+    !isCodexResponsesLiteRequest(bodyInput, clientHeaders) ||
+    !bodyInput ||
+    typeof bodyInput !== "object" ||
+    Array.isArray(bodyInput) ||
+    isCodexDelegationDependentModel(model)
+  ) {
+    return bodyInput;
   }
 
-  for (const level of STANDARD_EFFORT_SUFFIXES) {
-    if (modelId.endsWith(`-${level}`)) {
-      return {
-        baseModel: modelId.slice(0, -`-${level}`.length),
-        effort: level,
-      };
-    }
-  }
-  return { baseModel: modelId, effort: null };
+  const body = bodyInput as Record<string, unknown>;
+  if (body.parallel_tool_calls === false) return bodyInput;
+  return { ...body, parallel_tool_calls: false };
 }
 
 export function getCodexUpstreamModel(model: unknown): string {
@@ -269,6 +303,59 @@ export function stripStoredItemReferences(body: Record<string, unknown>): void {
   if (strippedCount > 0) {
     console.debug(
       `[Codex] stripStoredItemReferences: sanitized ${strippedCount} server-generated ID(s) from input`
+    );
+  }
+}
+
+function stripOrphanedCodexFunctionCallOutputs(body: Record<string, unknown>): void {
+  if (!Array.isArray(body.input)) return;
+  // A previous_response_id delegates history resolution to the upstream
+  // Responses service, so a matching function_call may legitimately live in
+  // that remote response rather than in the local input array.
+  if (typeof body.previous_response_id === "string" && body.previous_response_id.trim()) return;
+
+  const callIds = new Set<string>();
+  let outputCount = 0;
+
+  for (const item of body.input) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+
+    if (record.type === "function_call" && typeof record.call_id === "string") {
+      callIds.add(record.call_id);
+    }
+
+    if (Array.isArray(record.tool_calls)) {
+      for (const toolCall of record.tool_calls) {
+        if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) continue;
+        const toolCallId = (toolCall as Record<string, unknown>).id;
+        if (typeof toolCallId === "string") {
+          callIds.add(toolCallId);
+        }
+      }
+    }
+
+    if (record.type === "function_call_output") {
+      outputCount++;
+    }
+  }
+
+  if (outputCount === 0) return;
+
+  const before = body.input.length;
+  body.input = body.input.filter((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+    const record = item as Record<string, unknown>;
+    if (record.type === "function_call_output" && typeof record.call_id === "string") {
+      return callIds.has(record.call_id);
+    }
+    return true;
+  });
+
+  const removedCount = before - body.input.length;
+  if (removedCount > 0) {
+    console.debug(
+      `[Codex] stripOrphanedCodexFunctionCallOutputs: removed ${removedCount} orphaned function_call_output item(s)`
     );
   }
 }
@@ -616,18 +703,34 @@ function extractCodexSseErrorMessage(text: string, fallback: string): string {
 }
 
 type CodexSseTransientErrorPeek =
-  | { matched: string; message: string; replacementBody: null }
-  | { matched: null; message: null; replacementBody: ReadableStream<Uint8Array> | null };
+  | { matched: string; message: string; replacementBody: null; timedOut?: false }
+  | {
+      matched: null;
+      message: null;
+      replacementBody: ReadableStream<Uint8Array> | null;
+      timedOut?: boolean;
+    };
 
 /**
  * Peek the first bytes of a Codex SSE response body looking for a transient
  * error embedded in an otherwise 200-OK stream. Exported for unit testing.
+ * `timeoutMs` bounds EACH individual read (#8020) — defaults to
+ * FETCH_BODY_TIMEOUT_MS; overridable so tests can settle fast/deterministically.
  */
 export async function peekCodexSseTransientError(
-  response: Response
+  response: Response,
+  timeoutMs: number = FETCH_BODY_TIMEOUT_MS
 ): Promise<CodexSseTransientErrorPeek> {
   const contentType = response.headers.get("content-type") || "";
-  if (!response.ok || !response.body || !contentType.includes("text/event-stream")) {
+  // #7536: check content-type BEFORE touching `response.body`. On the wreq-js
+  // TLS-fingerprint transport (used by Codex), the Response is backed by a native
+  // body handle and merely accessing `.body` disturbs it, so a downstream
+  // `.text()` throws "Response body is already used". The Codex non-stream
+  // upstream response has an empty content-type, so it must short-circuit here
+  // WITHOUT reading `.body` — otherwise chatCore's readNonStreamingResponseBody
+  // 502s. Only genuine SSE responses (which this peek intends to buffer) reach
+  // the `.body` access below.
+  if (!response.ok || !contentType.includes("text/event-stream") || !response.body) {
     return { matched: null, message: null, replacementBody: null };
   }
 
@@ -639,8 +742,12 @@ export async function peekCodexSseTransientError(
 
   try {
     while (text.length < CODEX_SSE_PEEK_MAX_BYTES) {
-      const { done, value } = await reader.read();
+      const { done, value, timedOut } = await readCodexPeekChunk(reader, timeoutMs);
+      if (timedOut) {
+        return { matched: null, message: null, replacementBody: null, timedOut: true };
+      }
       if (done) break;
+      if (!value) continue;
       chunks.push(value);
       text += decoder.decode(value, { stream: true });
       const lower = text.toLowerCase();
@@ -675,31 +782,14 @@ export async function peekCodexSseTransientError(
     return { matched, message: extractCodexSseErrorMessage(text, matched), replacementBody: null };
   }
 
-  reader.releaseLock();
-
   // Re-assemble the stream: peeked prefix chunks, then continue draining the
-  // same underlying body so bytes downstream of the peek window are untouched.
-  const upstreamReader = response.body.getReader();
-  const replacementBody = new ReadableStream<Uint8Array>({
-    start(controller) {
-      for (const chunk of chunks) controller.enqueue(chunk);
-    },
-    async pull(controller) {
-      const { done, value } = await upstreamReader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      controller.enqueue(value);
-    },
-    cancel(reason) {
-      try {
-        upstreamReader.cancel(reason).catch(() => {});
-      } catch {
-        // noop — upstream socket may already be closing.
-      }
-    },
-  });
+  // SAME reader we already hold. The previous code called reader.releaseLock()
+  // and then response.body.getReader() a second time — but re-acquiring a reader
+  // on an already-disturbed body throws "Response body is already used" on
+  // undici (every non-stream Codex request 502'd, then got mis-classified as a
+  // 60s rate limit). Keep the original reader; never touch response.body again.
+  const upstreamReader = reader;
+  const replacementBody = buildCodexTimeoutSafePassthroughBody(chunks, upstreamReader, timeoutMs);
 
   return { matched: null, message: null, replacementBody };
 }
@@ -791,24 +881,30 @@ export class CodexExecutor extends BaseExecutor {
   }
 
   async execute(input: ExecuteInput) {
+    const requestBody = enforceCodexResponsesLiteParallelToolCalls(
+      input.body,
+      input.clientHeaders,
+      input.model
+    );
+    const requestInput = requestBody === input.body ? input : { ...input, body: requestBody };
     const sessionId = this.getPromptCacheSessionId(
-      input.credentials,
-      input.body as Record<string, unknown> | null
+      requestInput.credentials,
+      requestInput.body as Record<string, unknown> | null
     );
     const identity = createCodexClientIdentity(
       sessionId,
-      input.credentials?.providerSpecificData ?? null
+      requestInput.credentials?.providerSpecificData ?? null
     );
     const credentials = identity
       ? {
-          ...input.credentials,
+          ...requestInput.credentials,
           providerSpecificData: {
-            ...(input.credentials?.providerSpecificData || {}),
+            ...(requestInput.credentials?.providerSpecificData || {}),
             codexClientIdentity: identity,
           },
         }
-      : input.credentials;
-    const nextInput = { ...input, credentials };
+      : requestInput.credentials;
+    const nextInput = { ...requestInput, credentials };
 
     if (!isCodexResponsesWebSocketRequired(nextInput.model, nextInput.credentials)) {
       const httpResult = await super.execute(nextInput);
@@ -829,6 +925,17 @@ export class CodexExecutor extends BaseExecutor {
           (httpResult as { response: Response }).response = errorResponse(
             HTTP_STATUS.SERVICE_UNAVAILABLE,
             peek.message
+          );
+        } else if (peek.timedOut) {
+          // #8020: the peek's first-chunk read never returned (upstream body went
+          // silent). Convert to a bounded 504 instead of letting the caller hang.
+          input.log?.warn?.(
+            "TIMEOUT",
+            "CODEX | 200-OK SSE peek read timed out — upstream body stalled, returning 504"
+          );
+          (httpResult as { response: Response }).response = errorResponse(
+            HTTP_STATUS.GATEWAY_TIMEOUT,
+            "Upstream Codex SSE body read timed out"
           );
         } else if (peek.replacementBody) {
           (httpResult as { response: Response }).response = new Response(peek.replacementBody, {
@@ -1239,6 +1346,7 @@ export class CodexExecutor extends BaseExecutor {
         dropInternalAssistantMessages: !nativeCodexPassthrough,
       });
     }
+    stripOrphanedCodexFunctionCallOutputs(body);
     repairMissingCodexFunctionCallOutputs(body);
 
     // ── Cache-aware system prompt handling (both paths) ──

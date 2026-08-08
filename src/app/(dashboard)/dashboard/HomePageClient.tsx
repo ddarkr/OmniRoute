@@ -9,6 +9,10 @@ import { useRouter } from "next/navigation";
 import { Card, CardSkeleton, Button, Modal } from "@/shared/components";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 import { AI_PROVIDERS, NOAUTH_PROVIDERS, OAUTH_PROVIDERS } from "@/shared/constants/providers";
+import {
+  isProviderConnectionConnected,
+  isProviderConnectionErrored,
+} from "@/shared/utils/providerConnectionStatus";
 import { useNotificationStore } from "@/store/notificationStore";
 import { extractApiErrorMessage } from "@/shared/http/apiErrorMessage";
 import { copyToClipboard } from "@/shared/utils/clipboard";
@@ -99,6 +103,12 @@ function mergeUpdateStep(steps: UpdateStep[], nextStep: UpdateStep) {
   next[idx] = nextStep;
   return next;
 }
+
+// Quick-start link classes, extracted so each <Link> still fits on one line with
+// prefetch={false} (#8281) — this file is size-frozen.
+const INLINE_LINK = "text-primary hover:underline";
+const DOCS_LINK =
+  "hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors";
 
 export default function HomePageClient({ machineId }: HomePageClientProps) {
   const router = useRouter();
@@ -423,19 +433,11 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   const providerStats = useMemo(() => {
     return Object.entries(AI_PROVIDERS).map(([providerId, providerInfo]) => {
       const connections = providerConnections.filter((conn) => conn.provider === providerId);
-      const connected = connections.filter(
-        (conn) =>
-          conn.isActive !== false &&
-          (conn.testStatus === "active" ||
-            conn.testStatus === "success" ||
-            conn.testStatus === "unknown")
+      const connected = connections.filter((connection) =>
+        isProviderConnectionConnected(connection)
       ).length;
-      const errors = connections.filter(
-        (conn) =>
-          conn.isActive !== false &&
-          (conn.testStatus === "error" ||
-            conn.testStatus === "expired" ||
-            conn.testStatus === "unavailable")
+      const errors = connections.filter((connection) =>
+        isProviderConnectionErrored(connection)
       ).length;
 
       const providerKeys = new Set([providerId, providerInfo.alias].filter(Boolean));
@@ -468,8 +470,26 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   }, [selectedProvider, models]);
 
   const topologyProviders = useMemo(() => {
-    const byProvider = new Map<string, { id: string; provider: string; name?: string }>();
+    type ProviderHealth = "active" | "error" | "idle";
+    const byProvider = new Map<
+      string,
+      { id: string; provider: string; name?: string; status: ProviderHealth }
+    >();
     const providerConfig = AI_PROVIDERS as Record<string, { name?: string }>;
+
+    // Connection-health per provider, so the topology node reflects "what is connected"
+    // at rest (green healthy / red error) instead of going blank between requests. A
+    // provider with ≥1 healthy connection is "active"; if none are healthy but some are
+    // errored it is "error"; otherwise "idle". Live/recent traffic still overrides this.
+    const healthByProvider = new Map<string, ProviderHealth>();
+    for (const stat of providerStats) {
+      const canonical = normalizeProviderId(stat.id);
+      if (!canonical) continue;
+      healthByProvider.set(
+        canonical,
+        stat.connected > 0 ? "active" : stat.errors > 0 ? "error" : "idle"
+      );
+    }
 
     const addProvider = (providerId?: string | null, name?: string) => {
       const rawProviderId = typeof providerId === "string" ? providerId.trim() : "";
@@ -477,6 +497,12 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
 
       const canonicalProviderId = normalizeProviderId(rawProviderId);
       if (!canonicalProviderId || byProvider.has(canonicalProviderId)) return;
+
+      // Exclude providers with no active connections (or where all connections are deactivated)
+      const hasActiveConn = providerConnections.some(
+        (c) => normalizeProviderId(c.provider) === canonicalProviderId && c.isActive !== false
+      );
+      if (!hasActiveConn) return;
 
       const resolvedName =
         getProviderDisplayLabel(rawProviderId, providerNodes) ||
@@ -488,16 +514,18 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
         id: canonicalProviderId,
         provider: canonicalProviderId,
         name: resolvedName,
+        status: healthByProvider.get(canonicalProviderId) ?? "idle",
       });
     };
 
     providerStats
       .filter((provider) => provider.total > 0)
       .forEach((provider) => addProvider(provider.id, provider.provider.name));
+    providerConnections.forEach((conn) => addProvider(conn.provider));
     Object.keys(providerMetrics).forEach((provider) => addProvider(provider));
 
     return Array.from(byProvider.values());
-  }, [providerStats, providerMetrics, providerNodes]);
+  }, [providerStats, providerMetrics, providerNodes, providerConnections]);
 
   const { lastProvider, errorProvider } = providerTopology;
 
@@ -1073,10 +1101,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                 <h2 className="text-lg font-semibold">{t("quickStart")}</h2>
                 <p className="text-sm text-text-muted">{t("quickStartDesc")}</p>
               </div>
-              <Link
-                href="/docs"
-                className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors"
-              >
+              <Link href="/docs" prefetch={false} className={DOCS_LINK}>
                 <span className="material-symbols-outlined text-[14px]">menu_book</span>
                 {t("fullDocs")}
               </Link>
@@ -1094,7 +1119,8 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                       endpoint: (chunks) => (
                         <Link
                           href="/dashboard/api-manager"
-                          className="text-primary hover:underline"
+                          prefetch={false}
+                          className={INLINE_LINK}
                         >
                           {chunks}
                         </Link>
@@ -1112,7 +1138,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                   <p className="text-text-muted mt-0.5">
                     {t.rich("step2Desc", {
                       providers: (chunks) => (
-                        <Link href="/dashboard/providers" className="text-primary hover:underline">
+                        <Link href="/dashboard/providers" prefetch={false} className={INLINE_LINK}>
                           {chunks}
                         </Link>
                       ),
@@ -1140,12 +1166,12 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                   <p className="text-text-muted mt-0.5">
                     {t.rich("step4Desc", {
                       logs: (chunks) => (
-                        <Link href="/dashboard/logs" className="text-primary hover:underline">
+                        <Link href="/dashboard/logs" prefetch={false} className={INLINE_LINK}>
                           {chunks}
                         </Link>
                       ),
                       analytics: (chunks) => (
-                        <Link href="/dashboard/analytics" className="text-primary hover:underline">
+                        <Link href="/dashboard/analytics" prefetch={false} className={INLINE_LINK}>
                           {chunks}
                         </Link>
                       ),

@@ -98,6 +98,21 @@ test("GithubExecutor.buildUrl routes unlisted Codex models to /responses (9route
   );
 });
 
+test("GithubExecutor.buildUrl routes gpt-5.6-sol/terra/luna to /responses (regression)", () => {
+  // These models were registered in the `gh` registry without targetFormat, so
+  // getModelTargetFormat returned null and requests fell through to
+  // /chat/completions -> upstream 400 "model is not accessible via the
+  // /chat/completions endpoint". They only support /responses upstream.
+  const executor = new GithubExecutor();
+  for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    assert.equal(
+      executor.buildUrl(model, true),
+      "https://api.githubcopilot.com/responses",
+      `${model} must route to /responses`
+    );
+  }
+});
+
 test("GithubExecutor.transformRequest injects JSON response instructions for Claude and strips reasoning fields", () => {
   const executor = new GithubExecutor();
   const body = {
@@ -161,7 +176,13 @@ test("GithubExecutor.transformRequest sanitizes Anthropic-shape content parts (t
     ],
   };
 
-  const result = executor.transformRequest("claude-sonnet-4.6", body, true, {});
+  // Use an unregistered claude-* id (not "claude-sonnet-4.6"/etc.) so
+  // getModelTargetFormat("gh", ...) resolves to null and this stays on the
+  // /chat/completions path this test targets. Registered claude-* ids now
+  // carry targetFormat:"claude" (native /v1/messages — port of
+  // decolua/9router#2608, see github-copilot-claude-native-messages.test.ts)
+  // and intentionally skip this sanitization.
+  const result = executor.transformRequest("claude-sonnet-4", body, true, {});
 
   // user message keeps text + image_url parts untouched
   assert.equal(result.messages[0].content[0].type, "text");

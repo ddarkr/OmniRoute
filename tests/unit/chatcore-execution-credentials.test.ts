@@ -33,6 +33,16 @@ test("native Codex passthrough injects requestEndpointPath", () => {
   assert.equal(out.requestEndpointPath, "/v1/responses");
 });
 
+test("native Responses passthrough (xAI via codex flag) injects requestEndpointPath (#8964)", () => {
+  // chatCore ORs xAI into nativeCodexPassthrough before calling this helper.
+  const out = resolveExecutionCredentials({
+    ...base,
+    provider: "xai-oauth",
+    nativeCodexPassthrough: true,
+  }) as Record<string, unknown>;
+  assert.equal(out.requestEndpointPath, "/v1/responses");
+});
+
 test("azure-ai + responses target forces apiType=responses and the upstream marker", () => {
   const out = resolveExecutionCredentials({
     ...base,
@@ -79,6 +89,44 @@ test("non azure/oci providers never get apiType forcing", () => {
   assert.equal(psd._omnirouteForceResponsesUpstream, undefined);
 });
 
+test("AgentRouter threads the resolved Responses protocol only into execution credentials", () => {
+  const credentials = { providerSpecificData: { apiKeyHealth: {} } };
+  const out = resolveExecutionCredentials({
+    ...base,
+    provider: "agentrouter",
+    targetFormat: RESPONSES,
+    credentials,
+  }) as Record<string, unknown>;
+
+  assert.deepEqual(out.providerSpecificData, {
+    apiKeyHealth: {},
+    targetFormat: RESPONSES,
+  });
+  assert.deepEqual(credentials.providerSpecificData, { apiKeyHealth: {} });
+});
+
+test("#8969: poe + responses target sets the responses-upstream marker (no apiType)", () => {
+  const out = resolveExecutionCredentials({
+    ...base,
+    provider: "poe",
+    targetFormat: RESPONSES,
+  }) as Record<string, unknown>;
+  const psd = out.providerSpecificData as Record<string, unknown>;
+  assert.equal(psd.apiType, undefined);
+  assert.equal(psd._omnirouteForceResponsesUpstream, true);
+});
+
+test("#8969: poe + claude target disables OpenAI stream_options injection", () => {
+  const out = resolveExecutionCredentials({
+    ...base,
+    provider: "poe",
+    targetFormat: "claude",
+  }) as Record<string, unknown>;
+  const psd = out.providerSpecificData as Record<string, unknown>;
+  assert.equal(psd.disableStreamOptions, true);
+  assert.equal(psd._omnirouteForceResponsesUpstream, undefined);
+});
+
 test("ccSessionId is threaded into providerSpecificData when present", () => {
   const out = resolveExecutionCredentials({
     ...base,
@@ -95,4 +143,41 @@ test("missing providerSpecificData defaults to an empty object", () => {
     credentials: { connectionId: "c1" },
   }) as Record<string, unknown>;
   assert.deepEqual(out.providerSpecificData, {});
+});
+
+test("Kimi execution credentials carry the discovered protocol and thinking policy", () => {
+  const out = resolveExecutionCredentials({
+    ...base,
+    provider: "kimi-coding",
+    targetFormat: "claude",
+    modelInfo: {
+      supportsThinking: true,
+      alwaysThinking: true,
+      supportedThinkingEfforts: ["low", "medium", "high"],
+      defaultThinkingEffort: "medium",
+    },
+  }) as Record<string, unknown>;
+  const psd = out.providerSpecificData as Record<string, unknown>;
+  assert.equal(psd._omnirouteKimiTargetFormat, "claude");
+  assert.deepEqual(psd._omnirouteKimiThinking, {
+    supportsThinking: true,
+    alwaysThinking: true,
+    supportedThinkingEfforts: ["low", "medium", "high"],
+    defaultThinkingEffort: "medium",
+  });
+});
+
+test("Kimi Code k3 exposes its documented efforts from the offline policy before model import", () => {
+  const out = resolveExecutionCredentials({
+    ...base,
+    provider: "kimi-coding",
+    targetFormat: "claude",
+    modelInfo: { model: "k3" },
+  }) as Record<string, unknown>;
+  const psd = out.providerSpecificData as Record<string, unknown>;
+  assert.deepEqual(psd._omnirouteKimiThinking, {
+    supportsThinking: true,
+    supportedThinkingEfforts: ["low", "high", "max"],
+    defaultThinkingEffort: "max",
+  });
 });

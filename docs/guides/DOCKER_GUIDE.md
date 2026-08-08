@@ -86,19 +86,27 @@ OmniRoute ships four Compose profiles. Pick the one that matches your environmen
 
 OmniRoute relies on Redis to back the distributed rate limiter and shared cache. The `redis` service is **always defined** in `docker-compose.yml` (it has no profile gate) and starts alongside any other profile.
 
-| Detail               | Value                             |
-| -------------------- | --------------------------------- |
-| Image                | `redis:7-alpine`                  |
-| Container name       | `omniroute-redis`                 |
-| Internal port        | `6379`                            |
-| Host port (override) | `REDIS_PORT` (defaults to `6379`) |
-| Volume               | `omniroute-redis-data` → `/data`  |
-| Healthcheck          | `redis-cli ping` (10s interval)   |
+| Detail               | Value                                       |
+| -------------------- | ------------------------------------------- |
+| Image                | `redis:7-alpine`                            |
+| Container name       | `omniroute-redis`                           |
+| Internal port        | `6379`                                      |
+| Host port (override) | `REDIS_PORT` (defaults to `6379`)           |
+| Host bind (override) | `REDIS_BIND_HOST` (defaults to `127.0.0.1`) |
+| Volume               | `omniroute-redis-data` → `/data`            |
+| Healthcheck          | `redis-cli ping` (10s interval)             |
 
 Related environment variables:
 
 - `REDIS_URL` — connection string injected into the app (`redis://redis:6379` by default).
 - `REDIS_PORT` — host-side port mapping for the Redis container.
+- `REDIS_BIND_HOST` — host interface the port is published on. Defaults to `127.0.0.1`.
+
+> **Why loopback by default:** the sidecar runs without `requirepass`, and the app
+> containers reach it over the compose network (`redis:6379`) — the published port is
+> only there for host-side tooling (`redis-cli`, a local `npm run dev`). Publishing on
+> `0.0.0.0` would expose an unauthenticated Redis to every host on your LAN. If you set
+> `REDIS_BIND_HOST=0.0.0.0`, add `--requirepass` to the service `command:` as well.
 
 **Disabling Redis** is not recommended (rate limiter will degrade to in-memory fallback). If you must, either remove/comment the `redis:` service block in `docker-compose.yml` or scale it to zero:
 
@@ -170,11 +178,63 @@ Beyond the defaults documented in [ENVIRONMENT.md](../reference/ENVIRONMENT.md),
 | `OMNIROUTE_WS_BRIDGE_SECRET`  | Shared secret for the WebSocket bridge. **Required in production** — set to a strong random string. | unset (must be provided) |
 | `REDIS_URL`                   | Connection string for the rate limiter / cache backend                                              | `redis://redis:6379`     |
 | `REDIS_PORT`                  | Host-side port for the bundled Redis container                                                      | `6379`                   |
+| `REDIS_BIND_HOST`             | Host interface the bundled Redis port is published on (loopback unless you add AUTH)                | `127.0.0.1`              |
 | `AUTO_UPDATE_HOST_REPO_DIR`   | Host path mounted into `cli` profile at `/workspace/omniroute` for self-update workflows            | `.` (current directory)  |
 | `OMNIROUTE_MEMORY_MB`         | Runtime Node heap ceiling for the Docker standalone server; overrides the image fallback above      | `512`                    |
 | `DASHBOARD_PORT` / `API_PORT` | Override exposed ports for dashboard (20128) and API (20129)                                        | `20128` / `20129`        |
+| `OMNIROUTE_BASE_PATH`         | URL subpath when the app is published behind a reverse proxy (e.g. `/omniroute`)                    | _(empty = root)_         |
+| `NEXT_PUBLIC_BASE_URL`        | Public browser origin including the subpath (e.g. `https://host/omniroute`)                         | unset                    |
 | `PROD_DASHBOARD_PORT`         | Host-side dashboard port for `docker-compose.prod.yml`                                              | `20130`                  |
 | `CLIPROXYAPI_PORT`            | Host-side port for the `cliproxyapi` sidecar                                                        | `8317`                   |
+
+## Reverse Proxy on a Subpath (Traefik / nginx)
+
+Next.js `basePath` is compiled into the standalone bundle. OmniRoute records the baked
+value in a sentinel file at the app root (written during `npm run build`; read by
+`scripts/docker/ensure-docker-base-path.mjs`) and compares it with
+`OMNIROUTE_BASE_PATH` when the container starts. When they differ and the image was
+built for the domain root, the entrypoint rewrites the standalone manifests and embedded
+`basePath` literals before `node dev/run-standalone.mjs` runs.
+
+### Compose build (recommended)
+
+Set both variables in `.env`, then rebuild so the image and runtime agree:
+
+```bash
+# .env
+OMNIROUTE_BASE_PATH=/omniroute
+NEXT_PUBLIC_BASE_URL=https://myhostname.example.com/omniroute
+```
+
+```bash
+docker compose --profile base up -d --build
+```
+
+`docker-compose.yml` forwards `OMNIROUTE_BASE_PATH` as a Docker build-arg and as a
+runtime environment variable.
+
+### Pre-built root image + runtime subpath
+
+Published `diegosouzapw/omniroute:*` images are built for the domain root. You can still
+set `OMNIROUTE_BASE_PATH` at runtime; the container patches the bundle once on startup.
+Pair it with the matching public origin:
+
+```yaml
+services:
+  omniroute:
+    image: diegosouzapw/omniroute:latest
+    environment:
+      OMNIROUTE_BASE_PATH: /omniroute
+      NEXT_PUBLIC_BASE_URL: https://myhostname.example.com/omniroute
+```
+
+Configure the reverse proxy to forward the **full** external path (do not strip the
+prefix). Traefik should route `PathPrefix(`/omniroute`)` to the container without
+`StripPrefix`, so Next.js receives `/omniroute/...` and serves assets from
+`/omniroute/_next/...`.
+
+The Docker healthcheck probes `/api/monitoring/health` prefixed with the active
+`OMNIROUTE_BASE_PATH`.
 
 ## Docker Compose with Caddy (HTTPS Auto-TLS)
 

@@ -12,6 +12,7 @@
 import { z } from "zod";
 import { toolSearchTool } from "./toolSearch.ts";
 import { pickFastestModelTool } from "./pickFastestModel.ts";
+import { CCR_MCP_TOOLS } from "./ccrTools.ts";
 import {
   AUTO_ROUTING_STRATEGY_VALUES,
   ROUTING_STRATEGY_VALUES,
@@ -24,6 +25,7 @@ import {
 export type { AuditLevel, McpToolDefinition } from "./toolDefinition.ts";
 import type { McpToolDefinition } from "./toolDefinition.ts";
 export { pickFastestModelInput, pickFastestModelOutput } from "./pickFastestModel.ts";
+export * from "./ccrTools.ts";
 
 // ============ Phase 1: Essential Tools (8) ============
 
@@ -184,6 +186,53 @@ export const switchComboTool: McpToolDefinition<typeof switchComboInput, typeof 
       "Activates or deactivates a combo. When deactivated, requests will not be routed through this combo. Use to toggle between different routing strategies.",
     inputSchema: switchComboInput,
     outputSchema: switchComboOutput,
+    scopes: ["write:combos"],
+    auditLevel: "full",
+    phase: 1,
+    sourceEndpoints: ["/api/combos"],
+  };
+
+// --- Tool 4b: omniroute_create_combo ---
+export const createComboInput = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(100)
+    .describe("Unique combo name (letters, numbers, spaces, -, _, /, ., [ and ])"),
+  description: z.string().max(2000).optional().describe("Optional human-readable description"),
+  strategy: z
+    .enum(ROUTING_STRATEGY_VALUES)
+    .optional()
+    .describe("Routing strategy (default: priority)"),
+  models: z
+    .array(
+      z.object({
+        provider: z.string().describe("Provider name (e.g., 'claude', 'gemini')"),
+        model: z.string().describe("Model ID for that provider"),
+      })
+    )
+    .min(1)
+    .describe("Ordered model chain; order defines priority"),
+});
+
+export const createComboOutput = z.object({
+  success: z.boolean(),
+  combo: z.object({
+    id: z.string(),
+    name: z.string(),
+    strategy: z.string(),
+    enabled: z.boolean(),
+  }),
+});
+
+export const createComboTool: McpToolDefinition<typeof createComboInput, typeof createComboOutput> =
+  {
+    name: "omniroute_create_combo",
+    description:
+      "Registers a new combo (model chain) with a name, ordered model list, and optional routing strategy. Full validation (name collisions, nested-combo DAG, composite tiers) is enforced by the combos API.",
+    inputSchema: createComboInput,
+    outputSchema: createComboOutput,
     scopes: ["write:combos"],
     auditLevel: "full",
     phase: 1,
@@ -1093,11 +1142,31 @@ export const compressionStatusTool: McpToolDefinition<
 export const compressionConfigureInput = z.object({
   enabled: z.boolean().optional(),
   strategy: z
-    .enum(["off", "lite", "standard", "aggressive", "ultra", "rtk", "stacked", "omniglyph"])
+    .enum([
+      "off",
+      "lite",
+      "standard",
+      "aggressive",
+      "ultra",
+      "rtk",
+      "codex-responses",
+      "stacked",
+      "omniglyph",
+    ])
     .optional()
     .describe("Compression mode"),
   autoTriggerMode: z
-    .enum(["off", "lite", "standard", "aggressive", "ultra", "rtk", "stacked", "omniglyph"])
+    .enum([
+      "off",
+      "lite",
+      "standard",
+      "aggressive",
+      "ultra",
+      "rtk",
+      "codex-responses",
+      "stacked",
+      "omniglyph",
+    ])
     .optional(),
   maxTokens: z
     .number()
@@ -1130,7 +1199,7 @@ export const compressionConfigureTool: McpToolDefinition<
 > = {
   name: "omniroute_compression_configure",
   description:
-    "Configure compression settings at runtime. Supports enabling/disabling compression, changing strategy (off/lite/standard/aggressive/ultra/rtk/stacked), adjusting maxTokens threshold, targetRatio, auto-trigger mode, system prompt preservation, and MCP description compression.",
+    "Configure compression settings at runtime. Supports enabling/disabling compression, changing strategy (off/lite/standard/aggressive/ultra/rtk/codex-responses/stacked), adjusting maxTokens threshold, targetRatio, auto-trigger mode, system prompt preservation, and MCP description compression.",
   inputSchema: compressionConfigureInput,
   outputSchema: compressionConfigureOutput,
   scopes: ["write:compression"],
@@ -1140,7 +1209,7 @@ export const compressionConfigureTool: McpToolDefinition<
 };
 
 export const setCompressionEngineInput = z.object({
-  engine: z.enum(["off", "caveman", "rtk", "stacked"]).optional(),
+  engine: z.enum(["off", "caveman", "rtk", "codex-responses", "stacked"]).optional(),
   cavemanIntensity: z.enum(["lite", "full", "ultra"]).optional(),
   rtkIntensity: z.enum(["minimal", "standard", "aggressive"]).optional(),
   outputMode: z.boolean().optional(),
@@ -1438,6 +1507,7 @@ export const MCP_TOOLS = [
   listCombosTool,
   getComboMetricsTool,
   switchComboTool,
+  createComboTool,
   checkQuotaTool,
   routeRequestTool,
   costReportTool,
@@ -1462,6 +1532,7 @@ export const MCP_TOOLS = [
   setCompressionEngineTool,
   listCompressionCombosTool,
   compressionComboStatsTool,
+  ...CCR_MCP_TOOLS,
   oneproxyFetchTool,
   oneproxyRotateTool,
   oneproxyStatsTool,

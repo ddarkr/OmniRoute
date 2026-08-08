@@ -9,10 +9,12 @@ import { Card, Button, CardSkeleton } from "@/shared/components";
 import {
   NOAUTH_PROVIDERS,
   getProviderAlias,
+  getProviderById,
   isOpenAICompatibleProvider,
   isAnthropicCompatibleProvider,
   isClaudeCodeCompatibleProvider,
   supportsApiKeyOnFreeProvider,
+  supportsDualAuthProvider,
 } from "@/shared/constants/providers";
 import { getModelsByProviderId } from "@/shared/constants/models";
 import {
@@ -21,16 +23,19 @@ import {
 } from "@/lib/providers/managedAvailableModels";
 import { getProviderServiceKinds } from "@/lib/providers/serviceKindIndex";
 import { providerLacksModelListing } from "@/lib/providers/modelListingCapability";
+import { providerUsesCuratedModelsOnly } from "@/lib/providers/modelListingCapability";
 import { normalizeModelCatalogSource } from "@/shared/utils/modelCatalogSearch";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import { useNotificationStore } from "@/store/notificationStore";
-import { resolveDashboardProviderInfo } from "../providerPageUtils";
+import { resolveDashboardProviderInfo, resolveProviderHeaderLink } from "../providerPageUtils";
+import { findDefaultReferral } from "@/lib/radar/referrals";
 import { type ConnectionRowConnection } from "./components/ConnectionRow";
 import { useProviderConnections } from "./hooks/useProviderConnections";
 import { useProviderSettings } from "./hooks/useProviderSettings";
 import { useProviderModels } from "./hooks/useProviderModels";
 import { useCommandCodeAuth } from "./hooks/useCommandCodeAuth";
+import { useConnectionAutoSync } from "./hooks/useConnectionAutoSync";
 import { useExternalLinkFlow } from "./hooks/useExternalLinkFlow";
 import { useAuthFileHandlers } from "./hooks/useAuthFileHandlers";
 import { useModelImportHandlers } from "./hooks/useModelImportHandlers";
@@ -63,6 +68,7 @@ export default function ProviderDetailPageClient() {
   // ── UI-only modal state (not owned by hooks) ─────────────────────────────
   const [showOAuthModal, _setShowOAuthModal] = useState(false);
   const [reauthConnection, setReauthConnection] = useState<ConnectionRowConnection | null>(null);
+  const [showKimiAuthMethodModal, setShowKimiAuthMethodModal] = useState(false);
   const [showAddApiKeyModal, setShowAddApiKeyModal] = useState(false);
   const [showSiliconFlowEndpointModal, setShowSiliconFlowEndpointModal] = useState(false);
   const [siliconFlowInitialBaseUrl, setSiliconFlowInitialBaseUrl] = useState<string | undefined>();
@@ -91,10 +97,10 @@ export default function ProviderDetailPageClient() {
     providerId,
     getProviderServiceKinds(providerId, declaredServiceKinds)
   );
-
-  // ── Phase 1f hooks ────────────────────────────────────────────────────────
+  const usesCuratedModelsOnly = providerUsesCuratedModelsOnly(providerId);
   const {
     connections,
+    setConnections,
     providerNode,
     loading,
     retestingId,
@@ -107,30 +113,38 @@ export default function ProviderDetailPageClient() {
     batchDeleteConfirmOpen,
     healthFilter,
     page,
+    accountSearch,
     distributingProxies,
     proxyConfig,
     connProxyMap,
     cpaProviderEnabled,
+    upstreamProxyMode,
+    upstreamProxyFallbackBackend,
     refreshingId,
     setPage,
     setHealthFilter,
+    setAccountSearch,
     setSelectedIds,
     setBatchDeleteConfirmOpen,
     setBatchTestResults,
     setProviderNode,
     fetchConnections,
     fetchProxyConfig,
-    handleDelete,
+    deleteConfirm,
     handleUpdateConnectionStatus,
     handleToggleRateLimit,
+    handleToggleQuotaVisibility,
     handleToggleClaudeExtraUsage,
     handleToggleCodexLimit,
     handleToggleCliproxyapiMode,
+    handleSetUpstreamProxyMode,
     handleToggleProxyEnabled,
     handleTogglePerKeyProxyEnabled,
     handleRetestConnection,
     handleRefreshToken,
     handleSwapPriority,
+    handleReorderByAvailability,
+    reorderingByAvailability,
     handleBatchSetActive,
     handleBatchDeleteOpenModal,
     handleBatchDeleteConfirm,
@@ -201,6 +215,39 @@ export default function ProviderDetailPageClient() {
       openAiCompatibleName: t("openaiCompatibleName"),
     },
   });
+
+  // D28 — Radar default referral link ("Pegue seus créditos grátis"). Fetched
+  // from the LOCAL /api/radar/referrals route only (never talks to the
+  // private feed server directly) — same client-fetch pattern the Radar
+  // dashboard page already uses for its own data. This keeps the providers
+  // page decoupled from @/lib/radar (DB-touching, Node-only): a 404 (flag
+  // off) or 401/network failure just leaves `referralUrl` null, and
+  // `resolveProviderHeaderLink` below then falls back to the static catalog
+  // website — byte-identical to before this feature existed.
+  const [referralUrl, setReferralUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/radar/referrals");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const fixed = Array.isArray(data?.fixed) ? data.fixed : [];
+        const match = findDefaultReferral(fixed, providerId);
+        setReferralUrl(match?.url ?? null);
+      } catch {
+        // Best-effort only — never blocks rendering of the provider page.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [providerId]);
+  const { website: providerHeaderWebsite, isReferralLink } = resolveProviderHeaderLink(
+    providerInfo?.website,
+    referralUrl
+  );
   const providerSupportsOAuth =
     providerInfo?.toggleAuthType === "oauth" || providerInfo?.toggleAuthType === "free";
   const subscriptionRisk = providerInfo?.subscriptionRisk === true;
@@ -214,9 +261,12 @@ export default function ProviderDetailPageClient() {
   } = useConnectionGate({ providerId, subscriptionRisk });
 
   const providerSupportsPat = supportsApiKeyOnFreeProvider(providerId);
+  const supportsDualAuth = supportsDualAuthProvider(providerId);
   const isOAuth = providerSupportsOAuth && !providerSupportsPat;
   const providerAlias = getProviderAlias(providerId);
-  const isFreeNoAuth = NOAUTH_PROVIDERS[providerId]?.noAuth === true;
+  const isFreeNoAuth =
+    NOAUTH_PROVIDERS[providerId]?.noAuth === true ||
+    getProviderById(providerId)?.managedAccount === true;
   const registryModels = getModelsByProviderId(providerId);
   // Prefer synced API-discovered models when available, then merge built-ins
   // and user-managed custom models without duplicating IDs.
@@ -229,7 +279,7 @@ export default function ProviderDetailPageClient() {
     }));
 
     const registryIds = new Set(builtInModels.map((m) => m.id));
-    const syncedExtras = syncedAvailableModels
+    const syncedExtras = (usesCuratedModelsOnly ? [] : syncedAvailableModels)
       .filter((model: any) => model?.id && !registryIds.has(model.id))
       .map((model: any) => ({
         ...model,
@@ -238,7 +288,7 @@ export default function ProviderDetailPageClient() {
         source: "imported",
       }));
     const knownIds = new Set([...registryIds, ...syncedExtras.map((model: any) => model.id)]);
-    const customExtras = modelMeta.customModels
+    const customExtras = (usesCuratedModelsOnly ? [] : modelMeta.customModels)
       .filter((cm: any) => cm.id && !knownIds.has(cm.id))
       .map((cm: any) => ({
         id: cm.id,
@@ -251,16 +301,13 @@ export default function ProviderDetailPageClient() {
       if (m.id && !deduped.has(m.id)) deduped.set(m.id, m);
     }
     return Array.from(deduped.values());
-  }, [providerId, registryModels, syncedAvailableModels, modelMeta.customModels]);
-  const isManagedAvailableModelsProvider = isCompatible || providerId === "openrouter";
-  // isSearchProvider declared earlier (before hooks)
+  }, [registryModels, syncedAvailableModels, modelMeta.customModels, usesCuratedModelsOnly]);
   const isUpstreamProxyProvider = providerInfo?.category === "upstream-proxy";
   const compatibleSupportsModelImport = compatibleProviderSupportsModelImport(providerId);
 
   const providerStorageAlias = isCompatible ? providerId : providerAlias;
   const providerDisplayAlias = isCompatible ? providerNode?.prefix || providerId : providerAlias;
 
-  // ── Phase 1k: model import handlers ─────────────────────────────────────
   const {
     importingModels,
     showImportModal,
@@ -289,6 +336,13 @@ export default function ProviderDetailPageClient() {
     providerStorageAlias,
   });
 
+  const handleToggleConnectionAutoSync = useConnectionAutoSync(
+    connections,
+    setConnections,
+    notify,
+    t
+  );
+
   // ── model-related effects (loading gate) ────────────────────────────────
   useEffect(() => {
     if (loading || isSearchProvider) return;
@@ -310,14 +364,14 @@ export default function ProviderDetailPageClient() {
   }, [providerId]);
 
   const openPrimaryAddFlow = useCallback(() => {
+    if (providerId === "kimi-coding") return setShowKimiAuthMethodModal(true);
     if (isOAuth) {
       setShowOAuthModal(true);
       return;
     }
     openApiKeyAddFlow();
-  }, [isOAuth, openApiKeyAddFlow]);
+  }, [providerId, isOAuth, openApiKeyAddFlow]);
 
-  // ── Phase 1h: commandCode auth flow ─────────────────────────────────────
   const {
     commandCodeAuthState,
     handleCloseAddApiKeyModal,
@@ -421,8 +475,6 @@ export default function ProviderDetailPageClient() {
     providerNode,
   });
 
-  // renderModelsSection → components/ProviderModelsSection.tsx (Phase 1m)
-
   if (loading) {
     return (
       <div className="flex flex-col gap-8">
@@ -445,22 +497,20 @@ export default function ProviderDetailPageClient() {
 
   return (
     <div className="flex flex-col gap-8">
-      {/* Header — Phase 1t.1: extracted to components/ProviderPageHeader.tsx */}
       <ProviderPageHeader
         providerId={providerId}
-        providerInfo={providerInfo}
+        providerInfo={{ ...providerInfo, website: providerHeaderWebsite }}
         connectionsCount={connections.length}
         isOpenAICompatible={isOpenAICompatible}
         isAnthropicProtocolCompatible={isAnthropicProtocolCompatible}
         onOpenTutorial={() => setShowTutorialModal(true)}
         t={t}
+        isReferralLink={isReferralLink}
       />
 
       {providerId === "zed" && (
         <ZedImportCard fetchConnections={fetchConnections} notify={notify} />
       )}
-
-      {/* CompatibleNodeCard — Phase 1t.2: extracted to components/CompatibleNodeCard.tsx */}
       {isCompatible && providerNode && (
         <CompatibleNodeCard
           providerId={providerId}
@@ -474,23 +524,33 @@ export default function ProviderDetailPageClient() {
           t={t}
         />
       )}
-
-      {/* Connections */}
       {!isUpstreamProxyProvider && isFreeNoAuth && (
         <NoAuthProviderControls
           providerId={providerId}
           providerName={providerInfo?.name || providerId}
+          providerProxy={proxyConfig?.providers?.[providerId]}
+          onConfigureProviderProxy={() =>
+            setProxyTarget({
+              level: "provider",
+              id: providerId,
+              label: providerInfo?.name || providerId,
+            })
+          }
         />
       )}
       {!isUpstreamProxyProvider && !isFreeNoAuth && (
         <Card>
-          <ProviderAccountRoutingCard providerKey={providerId} connectionCount={connections.length} />
+          <ProviderAccountRoutingCard
+            providerKey={providerId}
+            connectionCount={connections.length}
+          />
           <ConnectionsHeaderToolbar
             providerId={providerId}
             providerInfo={providerInfo}
             isCompatible={isCompatible}
             isCommandCode={isCommandCode}
             isOAuth={isOAuth}
+            supportsDualAuth={supportsDualAuth}
             providerSupportsPat={providerSupportsPat}
             connections={connections}
             batchTesting={batchTesting}
@@ -498,6 +558,8 @@ export default function ProviderDetailPageClient() {
             retestingId={retestingId}
             distributingProxies={distributingProxies}
             proxyConfig={proxyConfig}
+            reorderingByAvailability={reorderingByAvailability}
+            handleReorderByAvailability={handleReorderByAvailability}
             preferClaudeCodeForUnprefixedClaudeModels={preferClaudeCodeForUnprefixedClaudeModels}
             claudeRoutingSettingsLoaded={claudeRoutingSettingsLoaded}
             claudeRoutingSettingsLoadError={claudeRoutingSettingsLoadError}
@@ -535,6 +597,7 @@ export default function ProviderDetailPageClient() {
               isCompatible={isCompatible}
               isCommandCode={isCommandCode}
               providerId={providerId}
+              supportsDualAuth={supportsDualAuth}
               providerSupportsPat={providerSupportsPat}
               commandCodeAuthState={commandCodeAuthState}
               gateConnectionFlow={gateConnectionFlow}
@@ -567,6 +630,7 @@ export default function ProviderDetailPageClient() {
                 distributingProxies={distributingProxies}
                 healthFilter={healthFilter}
                 page={page}
+                accountSearch={accountSearch}
                 PAGE_SIZE={PAGE_SIZE}
                 connProxyMap={connProxyMap}
                 proxyConfig={proxyConfig}
@@ -578,11 +642,18 @@ export default function ProviderDetailPageClient() {
                 setSelectedIds={setSelectedIds}
                 setPage={setPage}
                 setHealthFilter={setHealthFilter}
-                handleDelete={handleDelete}
+                setAccountSearch={setAccountSearch}
+                deleteConfirm={deleteConfirm}
                 handleUpdateConnectionStatus={handleUpdateConnectionStatus}
                 handleToggleRateLimit={handleToggleRateLimit}
+                handleToggleQuotaVisibility={handleToggleQuotaVisibility}
                 handleToggleClaudeExtraUsage={handleToggleClaudeExtraUsage}
+                canAutoSync={!usesCuratedModelsOnly && compatibleSupportsModelImport}
+                handleToggleConnectionAutoSync={handleToggleConnectionAutoSync}
                 handleToggleCliproxyapiMode={handleToggleCliproxyapiMode}
+                handleSetUpstreamProxyMode={handleSetUpstreamProxyMode}
+                upstreamProxyMode={upstreamProxyMode}
+                upstreamProxyFallbackBackend={upstreamProxyFallbackBackend}
                 handleToggleCodexLimit={handleToggleCodexLimit}
                 handleToggleProxyEnabled={handleToggleProxyEnabled}
                 handleTogglePerKeyProxyEnabled={handleTogglePerKeyProxyEnabled}
@@ -619,7 +690,6 @@ export default function ProviderDetailPageClient() {
       {!isSearchProvider && !isUpstreamProxyProvider && (
         <Card>
           <h2 className="text-lg font-semibold mb-4">{t("availableModels")}</h2>
-          {/* Phase 1m: extracted to components/ProviderModelsSection.tsx */}
           <ProviderModelsSection
             providerId={providerId}
             providerAlias={providerAlias}
@@ -629,8 +699,9 @@ export default function ProviderDetailPageClient() {
             isCcCompatible={isCcCompatible}
             isAnthropicCompatible={isAnthropicCompatible}
             isAnthropicProtocolCompatible={isAnthropicProtocolCompatible}
-            isManagedAvailableModelsProvider={isManagedAvailableModelsProvider}
+            isManagedAvailableModelsProvider={isCompatible || providerId === "openrouter"}
             compatibleSupportsModelImport={compatibleSupportsModelImport}
+            allowModelImport={!usesCuratedModelsOnly}
             models={models}
             modelMeta={modelMeta}
             modelAliases={modelAliases}
@@ -696,7 +767,6 @@ export default function ProviderDetailPageClient() {
       {/* Playground + param filters — extracted to components/ProviderExtraPanels.tsx (#6649) */}
       <ProviderExtraPanels providerId={providerId} />
 
-      {/* Modals — Phase 1t.5: extracted to components/ProviderModalsPanel.tsx */}
       <ProviderModalsPanel
         providerId={providerId}
         providerInfo={providerInfo}
@@ -710,6 +780,8 @@ export default function ProviderDetailPageClient() {
         showRiskNoticeModal={showRiskNoticeModal}
         handleConfirmRiskNotice={handleConfirmRiskNotice}
         handleCancelRiskNotice={handleCancelRiskNotice}
+        showKimiAuthMethodModal={showKimiAuthMethodModal}
+        setShowKimiAuthMethodModal={setShowKimiAuthMethodModal}
         showOAuthModal={showOAuthModal}
         reauthConnection={reauthConnection}
         handleOAuthSuccess={handleOAuthSuccess}
@@ -729,6 +801,7 @@ export default function ProviderDetailPageClient() {
         handleBatchDeleteConfirm={handleBatchDeleteConfirm}
         selectedIds={selectedIds}
         batchDeleting={batchDeleting}
+        deleteConfirm={deleteConfirm}
         applyCodexModalConnectionId={applyCodexModalConnectionId}
         setApplyCodexModalConnectionId={setApplyCodexModalConnectionId}
         applyingCodexAuthId={applyingCodexAuthId}

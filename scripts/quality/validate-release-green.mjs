@@ -96,9 +96,7 @@ export function firstFailureLine(out) {
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
-  const hit = lines.find((l) =>
-    /✖|✗|not ok|AssertionError|error TS|FAIL|Error:|REGRESS/i.test(l)
-  );
+  const hit = lines.find((l) => /✖|✗|not ok|AssertionError|error TS|FAIL|Error:|REGRESS/i.test(l));
   return (hit || lines[lines.length - 1] || "failed").slice(0, 200);
 }
 
@@ -113,15 +111,55 @@ export function eslintCounts(parsed) {
   return { errors, warnings };
 }
 
-/** Parse the eslint JSON array out of mixed stdout (tolerates a leading banner). */
+/**
+ * Parse the eslint JSON array out of mixed stdout (tolerates a leading banner AND trailing
+ * non-JSON text, e.g. ESLint 9.x's `--suppressions-location` "unpruned suppressions" stderr
+ * sentence glued onto the report when stdout+stderr are concatenated — #7837).
+ */
 export function parseEslintJson(out) {
-  const start = String(out || "").indexOf("[");
+  const str = String(out || "");
+  const start = str.indexOf("[");
   if (start < 0) return null;
+  // Fast path: the whole remainder is valid JSON (no trailing text).
   try {
-    return JSON.parse(String(out).slice(start));
+    return JSON.parse(str.slice(start));
   } catch {
-    return null;
+    // fall through to bracket-depth scan below
   }
+  // Slow path: find the matching closing "]" for the array that starts at `start`, tolerating
+  // any non-JSON text appended after it. Depth-tracks brackets while skipping over string
+  // literals (so a "]" or "[" inside a message string doesn't miscount).
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "[") {
+      depth++;
+    } else if (ch === "]") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(str.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 /** Pull the cognitive-complexity violation count from the gate's output. */
@@ -368,6 +406,11 @@ async function main() {
         "json",
         "--suppressions-location",
         "config/quality/eslint-suppressions.json",
+        // An "unpruned" suppression means a previously-frozen violation was legitimately
+        // fixed — release-time housekeeping (same bucket as ratchet drift), never a
+        // contributor-blocking defect. Without this flag ESLint 9.x exits 2 for that
+        // reason alone, which used to mask the real `--format json` report (#7837).
+        "--pass-on-unpruned-suppressions",
       ],
       { timeout: 30 * 60 * 1000 }
     );
@@ -525,10 +568,20 @@ async function main() {
     // release — that is why it is a HARD pre-flight gate.
     const slow = [
       {
+        // Raised 45→100min 2026-08-05: a hermetic-env run on the loaded devbox
+        // (load 7-26) was still inside invocation 1 of 3 at 76min when killed;
+        // contention factor 2-3× was measured against idle windows, and no idle
+        // measurement exists yet. The pre-flight's REAL condition is exactly
+        // this contended one (unit runs in Promise.all with integration+vitest
+        // plus whatever else the devbox carries), and there 45min provably
+        // killed a healthy suite and fabricated a false base-red. The ceiling's
+        // purpose — turning a genuine hang (stuck SQLite handle = zero progress
+        // forever) into a visible failure — survives at 100min.
+        // TODO: measure on the idle .113 box and re-tighten to ~1.8× measured.
         id: "unit",
-        label: "Unit tests (full suite, CI concurrency — runs ~20-35min silently)",
+        label: "Unit tests (full suite, CI concurrency — ~30-50min idle, up to ~100min under load)",
         args: ["run", "test:unit:ci"],
-        timeout: 45 * 60 * 1000,
+        timeout: 100 * 60 * 1000,
       },
       {
         id: "vitest",
@@ -537,10 +590,16 @@ async function main() {
         timeout: 15 * 60 * 1000,
       },
       {
+        // Measured 2026-08-05 on an idle 16-core box: 22m08s hermetic (935 tests,
+        // 112 files at --test-concurrency=1, i.e. strictly serial because ~16 of
+        // them bind a port or share a DB). The old "~3-10min" estimate was stale by
+        // ~3x and the 20min ceiling killed a healthy run. 40min keeps the ceiling's
+        // real purpose — turning a genuine hang (unreleased DB handle) into a
+        // visible failure — without punishing a long-but-healthy suite.
         id: "integration",
-        label: "Integration tests (~3-10min)",
+        label: "Integration tests (~20-25min)",
         args: ["run", "test:integration"],
-        timeout: 20 * 60 * 1000,
+        timeout: 40 * 60 * 1000,
       },
     ];
     if (WITH_BUILD) {

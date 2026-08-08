@@ -5,6 +5,11 @@ import {
 } from "../services/geminiThoughtSignatureStore.ts";
 import { normalizeOpenAICompatibleFinishReasonString } from "../utils/finishReason.ts";
 import { containsTextualToolCallMarker } from "../utils/textualToolCall.ts";
+import { getAnyReasoningValue } from "../utils/reasoningFields.ts";
+import {
+  caseInsensitiveToolNameLookup,
+  restoreOpenAIToolNames,
+} from "../translator/helpers/toolCallHelper.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -136,10 +141,17 @@ export function translateNonStreamingResponse(
 ): unknown {
   // If already in source format, return as-is
   if (targetFormat === sourceFormat) {
+    if (targetFormat === FORMATS.OPENAI) {
+      restoreOpenAIToolNames(responseBody, toolNameMap);
+    }
     return responseBody;
   }
 
   let intermediateOpenAI = responseBody;
+
+  if (targetFormat === FORMATS.OPENAI) {
+    restoreOpenAIToolNames(intermediateOpenAI, toolNameMap);
+  }
 
   // Handle OpenAI Responses API format
   if (targetFormat === FORMATS.OPENAI_RESPONSES) {
@@ -165,14 +177,18 @@ export function translateNonStreamingResponse(
           if (!part || typeof part !== "object") continue;
           const partObj = toRecord(part);
           if (partObj.type === "summary_text" && typeof partObj.text === "string") {
-            reasoningContent += partObj.text;
+            // #9500 — reasoning summary parts are discrete segments; join with "\n\n"
+            // (matches extractThinkingFromContent convention) so they don't glue back-to-back.
+            reasoningContent += reasoningContent ? `\n\n${partObj.text}` : partObj.text;
           }
         }
       } else if (itemObj.type === "reasoning" && Array.isArray(itemObj.summary)) {
         for (const part of itemObj.summary) {
           const partObj = toRecord(part);
           if (partObj.type === "summary_text" && typeof partObj.text === "string") {
-            reasoningContent += partObj.text;
+            // #9500 — reasoning summary parts are discrete segments; join with "\n\n"
+            // (matches extractThinkingFromContent convention) so they don't glue back-to-back.
+            reasoningContent += reasoningContent ? `\n\n${partObj.text}` : partObj.text;
           }
         }
       } else if (itemObj.type === "function_call") {
@@ -193,7 +209,7 @@ export function translateNonStreamingResponse(
           typeof argsToEmit === "string" ? argsToEmit : JSON.stringify(argsToEmit || {});
         const rawName = toString(itemObj.name);
         // Strip Claude OAuth proxy_ prefix using toolNameMap
-        const resolvedName = toolNameMap?.get(rawName) ?? rawName;
+        const resolvedName = caseInsensitiveToolNameLookup(rawName, toolNameMap) ?? rawName;
         toolCalls.push({
           id: callId,
           type: "function",
@@ -327,7 +343,9 @@ export function translateNonStreamingResponse(
                 for (const part of content.parts) {
                   const partObj = toRecord(part);
                   if (partObj.thought === true && typeof partObj.text === "string") {
-                    reasoningContent += partObj.text;
+                    // #9500 — Gemini thinking parts are discrete segments; join with "\n\n"
+                    // (matches extractThinkingFromContent convention) so they don't glue back-to-back.
+                    reasoningContent += reasoningContent ? `\n\n${partObj.text}` : partObj.text;
                     continue;
                   }
 
@@ -373,7 +391,8 @@ export function translateNonStreamingResponse(
                   if (partObj.functionCall) {
                     const fn = toRecord(partObj.functionCall);
                     const rawName = toString(fn.name);
-                    const restoredName = toolNameMap?.get(rawName) ?? rawName;
+                    const restoredName =
+                      caseInsensitiveToolNameLookup(rawName, toolNameMap) ?? rawName;
                     const nativeId = toString(fn.id);
                     const toolCallId =
                       nativeId.length > 0
@@ -492,7 +511,7 @@ export function translateNonStreamingResponse(
           thinkingContent += toString(blockObj.thinking);
         } else if (blockObj.type === "tool_use") {
           const rawName = toString(blockObj.name);
-          const strippedName = toolNameMap?.get(rawName) ?? rawName;
+          const strippedName = caseInsensitiveToolNameLookup(rawName, toolNameMap) ?? rawName;
           toolCalls.push({
             id: toString(blockObj.id, `call_${Date.now()}_${toolCalls.length}`),
             type: "function",
@@ -538,13 +557,35 @@ export function translateNonStreamingResponse(
 
       const usage = toRecord(root.usage);
       if (Object.keys(usage).length > 0) {
-        const promptTokens = toNumber(usage.input_tokens, 0);
+        // Mirror the streaming translator's usage contract (#1426/#2215):
+        // cache_read folds into prompt_tokens (it is billed prompt input);
+        // cache_creation stays out of prompt_tokens and is exposed via
+        // prompt_tokens_details, alongside cached_tokens (OpenAI field name).
+        const cachedTokens = toNumber(usage.cache_read_input_tokens, 0);
+        const cacheCreationTokens = toNumber(usage.cache_creation_input_tokens, 0);
+        const promptTokens = toNumber(usage.input_tokens, 0) + cachedTokens;
         const completionTokens = toNumber(usage.output_tokens, 0);
-        result.usage = {
+        const reasoningTokens = firstPositiveNumber(
+          toRecord(usage.output_tokens_details).thinking_tokens,
+          toRecord(usage.completion_tokens_details).reasoning_tokens,
+          usage.reasoning_tokens
+        );
+        const usageOut: JsonRecord = {
           prompt_tokens: promptTokens,
           completion_tokens: completionTokens,
           total_tokens: promptTokens + completionTokens,
         };
+        if (reasoningTokens > 0) {
+          usageOut.reasoning_tokens = reasoningTokens;
+          usageOut.completion_tokens_details = { reasoning_tokens: reasoningTokens };
+        }
+        if (cachedTokens > 0 || cacheCreationTokens > 0) {
+          const details: JsonRecord = {};
+          if (cachedTokens > 0) details.cached_tokens = cachedTokens;
+          if (cacheCreationTokens > 0) details.cache_creation_tokens = cacheCreationTokens;
+          usageOut.prompt_tokens_details = details;
+        }
+        result.usage = usageOut;
       }
 
       intermediateOpenAI = result;
@@ -556,33 +597,35 @@ export function translateNonStreamingResponse(
     return convertOpenAINonStreamingToClaude(toRecord(intermediateOpenAI));
   }
 
+  // Gemini-family clients (Gemini, Antigravity): the streaming SSE path already
+  // projects OpenAI chunks into the `{ response: { candidates: [...] } }` envelope
+  // via the registered FORMATS.OPENAI -> FORMATS.ANTIGRAVITY translator
+  // (translator/response/openai-to-antigravity.ts), but this non-streaming path had
+  // no equivalent back-conversion step — it silently returned the raw OpenAI
+  // chat.completion shape (leaking `choices[]`/`tool_calls` instead of
+  // `candidates[]`/`functionCall`) to any non-streaming Gemini/Antigravity client.
+  if (
+    (sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.ANTIGRAVITY) &&
+    sourceFormat !== targetFormat
+  ) {
+    return convertOpenAINonStreamingToGeminiFamily(toRecord(intermediateOpenAI));
+  }
+
   // Return intermediateOpenAI (which is either the raw response if unknown targetFormat, or an OpenAI compatible payload)
   return intermediateOpenAI;
 }
 
 /**
  * Resolve reasoning/thinking text off a non-streaming OpenAI-format message object.
- * Checks DeepSeek-style `reasoning_content`, then the OpenRouter/StepFun aliases
- * `reasoning` and `reasoning_details[]` (array of { text | content }), mirroring the
- * streaming translator's fallback chain in open-sse/translator/response/openai-to-claude.ts.
+ * Delegates to the shared reasoning-field resolver (`open-sse/utils/reasoningFields.ts`)
+ * so every reasoning alias — DeepSeek-style `reasoning_content`, the OpenRouter/StepFun
+ * `reasoning` string, GitHub Copilot's `reasoning_text`, `thinking`/`thought`, and
+ * `reasoning_details[]` (array of { text | content }) — is read from one place instead
+ * of a divergent local copy. Mirrors the streaming translator's fallback chain in
+ * open-sse/translator/response/openai-to-claude.ts.
  */
 function resolveReasoningText(messageObj: JsonRecord): string {
-  if (messageObj.reasoning_content) {
-    return toString(messageObj.reasoning_content);
-  }
-  if (typeof messageObj.reasoning === "string" && messageObj.reasoning) {
-    return messageObj.reasoning;
-  }
-  if (Array.isArray(messageObj.reasoning_details)) {
-    const parts: string[] = [];
-    for (const detail of messageObj.reasoning_details) {
-      const detailObj = toRecord(detail);
-      const text = detailObj.text ?? detailObj.content;
-      if (typeof text === "string" && text) parts.push(text);
-    }
-    return parts.join("");
-  }
-  return "";
+  return getAnyReasoningValue(messageObj);
 }
 
 /**
@@ -648,6 +691,35 @@ function convertOpenAINonStreamingToClaude(openaiResponse: JsonRecord): JsonReco
   if (stopReason === "tool_calls") stopReason = "tool_use";
 
   const usageSrc = toRecord(openaiResponse.usage);
+  const promptTokens = toNumber(usageSrc.prompt_tokens, 0);
+  const outputTokens = toNumber(usageSrc.completion_tokens, 0);
+
+  // Extract cache tokens from prompt_tokens_details (mirrors the streaming
+  // translator in open-sse/translator/response/openai-to-claude.ts lines 119-148).
+  const promptDetails = toRecord(usageSrc.prompt_tokens_details);
+  const cachedTokens = toNumber(promptDetails.cached_tokens, 0);
+  const cacheCreationTokens = toNumber(promptDetails.cache_creation_tokens, 0);
+
+  // OpenAI's prompt_tokens includes all prompt-side tokens (cached + non-cached).
+  // Claude expects input_tokens to be only non-cached tokens, with cached tokens
+  // exposed separately as cache_read_input_tokens.
+  const inputTokens = promptTokens - cachedTokens - cacheCreationTokens;
+
+  const usage: JsonRecord = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+  };
+
+  // Add cache_read_input_tokens if present
+  if (cachedTokens > 0) {
+    usage.cache_read_input_tokens = cachedTokens;
+  }
+
+  // Add cache_creation_input_tokens if present
+  if (cacheCreationTokens > 0) {
+    usage.cache_creation_input_tokens = cacheCreationTokens;
+  }
+
   const claudeResponse: JsonRecord = {
     id: toString(openaiResponse.id, `msg_${Date.now()}`),
     type: "message",
@@ -656,11 +728,97 @@ function convertOpenAINonStreamingToClaude(openaiResponse: JsonRecord): JsonReco
     content,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: {
-      input_tokens: toNumber(usageSrc.prompt_tokens, 0),
-      output_tokens: toNumber(usageSrc.completion_tokens, 0),
-    },
+    usage,
   };
 
   return claudeResponse;
+}
+
+const OPENAI_TO_GEMINI_FINISH_REASON: Record<string, string> = {
+  stop: "STOP",
+  length: "MAX_TOKENS",
+  tool_calls: "STOP",
+  content_filter: "SAFETY",
+};
+
+/**
+ * Parse an OpenAI tool-call `arguments` payload into a Gemini `functionCall.args`
+ * object. Never throws: a provider emitting malformed/truncated JSON must not take
+ * down the whole non-streaming response path, so an unparseable payload degrades to
+ * `{}` (matching the streaming Gemini translator's behaviour).
+ */
+function parseFunctionCallArgs(args: unknown): Record<string, unknown> {
+  if (typeof args !== "string") return toRecord(args);
+  try {
+    return toRecord(JSON.parse(args || "{}"));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Helper to convert an OpenAI chat.completion JSON object into the Gemini/Antigravity
+ * `{ response: { candidates: [...] } }` envelope for non-streaming clients. Mirrors the
+ * shape already produced for streaming by the registered
+ * FORMATS.OPENAI -> FORMATS.ANTIGRAVITY translator
+ * (translator/response/openai-to-antigravity.ts) so both paths agree.
+ */
+function convertOpenAINonStreamingToGeminiFamily(openaiResponse: JsonRecord): JsonRecord {
+  const choices = openaiResponse.choices as unknown[] | undefined;
+  const isChoicesArray = Array.isArray(choices);
+  if (!isChoicesArray && openaiResponse.object !== "chat.completion") {
+    return openaiResponse; // If it doesn't look like OpenAI, return as-is
+  }
+
+  const choice = isChoicesArray ? toRecord(choices[0]) : {};
+  const messageObj = toRecord(choice.message);
+
+  const parts: JsonRecord[] = [];
+  const reasoningText = resolveReasoningText(messageObj);
+  if (reasoningText) {
+    parts.push({ text: reasoningText, thought: true });
+  }
+  if (typeof messageObj.content === "string" && messageObj.content.length > 0) {
+    parts.push({ text: messageObj.content });
+  }
+  const toolCalls = Array.isArray(messageObj.tool_calls) ? messageObj.tool_calls : [];
+  for (const toolCall of toolCalls) {
+    const toolObj = toRecord(toolCall);
+    const fn = toRecord(toolObj.function);
+    parts.push({
+      functionCall: {
+        name: toString(fn.name),
+        args: parseFunctionCallArgs(fn.arguments),
+      },
+    });
+  }
+  if (parts.length === 0) parts.push({ text: "" });
+
+  const finishReason =
+    OPENAI_TO_GEMINI_FINISH_REASON[toString(choice.finish_reason, "stop")] ?? "STOP";
+
+  const usageSrc = toRecord(openaiResponse.usage);
+  const promptTokens = toNumber(usageSrc.prompt_tokens, 0);
+  const completionTokens = toNumber(usageSrc.completion_tokens, 0);
+
+  const geminiResponse: JsonRecord = {
+    response: {
+      candidates: [
+        {
+          content: { role: "model", parts },
+          finishReason,
+          index: 0,
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: promptTokens,
+        candidatesTokenCount: completionTokens,
+        totalTokenCount: toNumber(usageSrc.total_tokens, promptTokens + completionTokens),
+      },
+      modelVersion: toString(openaiResponse.model, "unknown"),
+      responseId: toString(openaiResponse.id, `resp_${Date.now()}`),
+    },
+  };
+
+  return geminiResponse;
 }

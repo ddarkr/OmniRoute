@@ -90,6 +90,32 @@ test("VertexExecutor.buildUrl routes partner and org-prefixed models to the glob
   );
 });
 
+test("VertexExecutor.buildUrl routes current-generation Claude models to the native Anthropic rawPredict endpoint (#1985, #8994)", () => {
+  const executor = new VertexExecutor();
+
+  // These model IDs post-date the old pinned "claude-3-5-sonnet" / "claude-3-opus" /
+  // "claude-3-haiku" prefixes and were previously misrouted to the Google-publisher path,
+  // then (once generalized to a "claude-" prefix, #1985) to the generic OpenAI-compatible
+  // partner endpoint. Claude models use Vertex's native Anthropic Messages API
+  // (publishers/anthropic/.../rawPredict) instead — the partner endpoint 404s/"malformed
+  // argument"s for Claude on at least some projects.
+  const claude4Sonnet = executor.buildUrl("claude-sonnet-4-6", false, 0, {
+    apiKey: createServiceAccountJson({ projectId: "proj-claude" }),
+  });
+  const claude4Haiku = executor.buildUrl("claude-haiku-4-5@20251001", true, 0, {
+    apiKey: createServiceAccountJson({ projectId: "proj-claude" }),
+  });
+
+  assert.equal(
+    claude4Sonnet,
+    "https://aiplatform.googleapis.com/v1/projects/proj-claude/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-6:rawPredict"
+  );
+  assert.equal(
+    claude4Haiku,
+    "https://aiplatform.googleapis.com/v1/projects/proj-claude/locations/us-central1/publishers/anthropic/models/claude-haiku-4-5@20251001:rawPredict"
+  );
+});
+
 test("VertexExecutor.buildHeaders includes Bearer token and SSE Accept only for streaming", () => {
   const executor = new VertexExecutor();
   const streamHeaders = executor.buildHeaders({ accessToken: "ya29.stream" }, true);

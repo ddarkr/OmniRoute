@@ -36,6 +36,9 @@ const { hasEncryptedCredentials } = require("./sqlite-inspection");
 const { loginManager } = require("./loginManager");
 const { killProcessTree } = require("./processTree");
 const { resolveServerEntry } = require("./lib/resolveServerEntry");
+const { resolveDarwinHelperExecutable } = require("./lib/resolveNodeHelper");
+const { resolveRemoteServerUrl, isValidHttpUrl } = require("./lib/resolveRemoteServerUrl");
+const { writeRemoteServerUrl } = require("./lib/remoteServerPreferences");
 
 // ── Single Instance Lock ───────────────────────────────────
 const gotTheLock = app.requestSingleInstanceLock();
@@ -66,8 +69,23 @@ let tray = null;
 let nextServer = null;
 let serverPort = 20128;
 let isServerStopped = false;
+let remoteServerPromptWindow = null;
 
-const getServerUrl = () => `http://localhost:${serverPort}`;
+// ── Remote Server Mode ──────────────────────────────────────
+// Lets the desktop shell attach to an already-running OmniRoute server (e.g. a
+// Docker/OrbStack container, or another machine) instead of spawning its own
+// bundled Next.js server. See lib/resolveRemoteServerUrl.js for precedence
+// (OMNIROUTE_REMOTE_URL env var, then the persisted prefs file below).
+const REMOTE_SERVER_PREFS_PATH = path.join(
+  resolveDataDir(null, process.env),
+  "electron-preferences.json"
+);
+let remoteServerUrl = resolveRemoteServerUrl({
+  env: process.env,
+  prefsPath: REMOTE_SERVER_PREFS_PATH,
+});
+
+const getServerUrl = () => remoteServerUrl || `http://localhost:${serverPort}`;
 
 function resolveNodeExecutable(env = process.env) {
   // #1081: Ensure Next.js standalone runs using Electron's Node runtime
@@ -79,23 +97,16 @@ function resolveNodeExecutable(env = process.env) {
   // flash a shell window. Use the Helper binary instead — macOS treats
   // Helper processes as background tasks with no visible UI artifacts.
   if (process.platform === "darwin" && !isDev) {
-    const helperPath = path.join(path.dirname(process.execPath), `${app.getName()} Helper`);
-    if (fs.existsSync(helperPath)) {
-      return helperPath;
-    }
-    // Electron \u003e= 20 may use "(Renderer)" / "(GPU)" / "(Plugin)" suffixed helpers.
-    // The unsuffixed Helper is the one suitable for ELECTRON_RUN_AS_NODE.
-    const frameworkHelper = path.join(
-      path.dirname(process.execPath),
-      "..",
-      "Frameworks",
-      `${app.getName()} Helper.app`,
-      "Contents",
-      "MacOS",
-      `${app.getName()} Helper`
-    );
-    if (fs.existsSync(frameworkHelper)) {
-      return frameworkHelper;
+    // #7941: derive the Helper name from the packaged binary name
+    // (path.basename(process.execPath)) rather than app.getName(). electron-builder
+    // generates BOTH the main binary and the Helper.app bundles from build.productName
+    // ("OmniRoute"), whereas app.getName() reads package.json `name` ("omniroute-desktop")
+    // — the two diverged, so app.getName() never matched a real Helper path and this fell
+    // through to process.execPath, spawning the main Electron binary and producing a
+    // second, inert macOS Dock icon.
+    const helper = resolveDarwinHelperExecutable({ execPath: process.execPath });
+    if (helper) {
+      return helper;
     }
   }
   return process.execPath;
@@ -462,6 +473,23 @@ function createTray() {
         { label: "3000", click: () => changePort(3000) },
         { label: "8080", click: () => changePort(8080) },
       ],
+      enabled: !remoteServerUrl,
+    },
+    {
+      label: "Remote Server",
+      submenu: [
+        {
+          label: remoteServerUrl ? `Connected: ${remoteServerUrl}` : "Using local embedded server",
+          enabled: false,
+        },
+        { type: "separator" },
+        { label: "Connect to Remote Server…", click: () => showRemoteServerPrompt() },
+        {
+          label: "Disconnect (use Local Server)",
+          enabled: Boolean(remoteServerUrl),
+          click: () => setRemoteServerUrl(null),
+        },
+      ],
     },
     { type: "separator" },
     {
@@ -518,8 +546,97 @@ async function changePort(newPort) {
   console.log(`[Electron] Port changed: ${oldPort} → ${serverPort}`);
 }
 
+// ── Remote Server Mode: prompt window ──────────────────────
+function showRemoteServerPrompt() {
+  if (remoteServerPromptWindow && !remoteServerPromptWindow.isDestroyed()) {
+    remoteServerPromptWindow.show();
+    remoteServerPromptWindow.focus();
+    return;
+  }
+
+  remoteServerPromptWindow = new BrowserWindow({
+    width: 480,
+    height: 210,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    title: "Connect to Remote Server",
+    parent: mainWindow || undefined,
+    modal: Boolean(mainWindow),
+    webPreferences: {
+      preload: path.join(__dirname, "remoteServerPromptPreload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  remoteServerPromptWindow.setMenuBarVisibility(false);
+  remoteServerPromptWindow.loadFile(path.join(__dirname, "assets", "remoteServerPrompt.html"));
+
+  remoteServerPromptWindow.on("closed", () => {
+    remoteServerPromptWindow = null;
+  });
+}
+
+// ── Remote Server Mode: apply a new URL (or clear it) ──────
+async function setRemoteServerUrl(nextUrl) {
+  const normalized = (nextUrl || "").trim() || null;
+  if (normalized === remoteServerUrl) return;
+
+  // Reject invalid URLs — only http:// and https:// are accepted.
+  if (normalized !== null && !isValidHttpUrl(normalized)) {
+    console.warn("[Electron] Rejected invalid remote server URL:", normalized);
+    return;
+  }
+
+  sendToRenderer("server-status", { status: "restarting", port: serverPort });
+
+  // Stop any locally-spawned server before switching modes in either direction.
+  const serverToStop = nextServer;
+  stopNextServer();
+  await waitForServerExit(serverToStop);
+
+  remoteServerUrl = normalized;
+  writeRemoteServerUrl(REMOTE_SERVER_PREFS_PATH, remoteServerUrl);
+
+  startNextServer();
+  try {
+    await waitForServer(`${getServerUrl()}/api/monitoring/health`);
+  } catch (err) {
+    console.warn("[Electron] Server did not become ready after remote-server change:", err.message);
+  }
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.loadURL(getServerUrl());
+  }
+  createTray();
+
+  sendToRenderer("server-status", {
+    status: "running",
+    port: serverPort,
+    remoteUrl: remoteServerUrl,
+  });
+  console.log(
+    remoteServerUrl
+      ? `[Electron] Now connected to remote server: ${remoteServerUrl}`
+      : "[Electron] Disconnected from remote server — spawning local server again"
+  );
+}
+
 // ── Server Lifecycle (#1, #5, #10) ─────────────────────────
 function startNextServer() {
+  if (remoteServerUrl) {
+    console.log("[Electron] Remote server mode — connecting to", remoteServerUrl);
+    sendToRenderer("server-status", {
+      status: "running",
+      port: serverPort,
+      remoteUrl: remoteServerUrl,
+    });
+    return;
+  }
+
   if (isDev) {
     console.log("[Electron] Dev mode — connect to existing Next.js server");
     sendToRenderer("server-status", { status: "running", port: serverPort });
@@ -783,7 +900,21 @@ function setupIpcHandlers() {
     platform: process.platform,
     isDev,
     port: serverPort,
+    remoteServerUrl,
   }));
+
+  // ── Remote Server Mode: prompt window IPC (main-process-only trust
+  // boundary — this window never loads remote/untrusted content) ──
+  ipcMain.handle("remote-server-prompt:get-initial-url", () => remoteServerUrl || "");
+
+  ipcMain.on("remote-server-prompt:submit", (_event, url) => {
+    remoteServerPromptWindow?.close();
+    void setRemoteServerUrl(url);
+  });
+
+  ipcMain.on("remote-server-prompt:cancel", () => {
+    remoteServerPromptWindow?.close();
+  });
 
   ipcMain.handle("open-external", (_event, url) => {
     try {

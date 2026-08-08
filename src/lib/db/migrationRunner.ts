@@ -19,6 +19,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import type { SqliteAdapter } from "./adapters/types";
 import { DEFAULT_DATABASE_SETTINGS } from "@/types/databaseSettings";
+import { isAutomatedTestProcess } from "@/shared/utils/testProcess";
 import {
   RENAMED_MIGRATION_COMPATIBILITY,
   LEGACY_VERSION_SLOT_MIGRATIONS,
@@ -27,6 +28,7 @@ import {
   INITIAL_SCHEMA_SENTINELS,
   OPTIONAL_FTS5_MIGRATION_VERSIONS,
 } from "./migrationRunner/constants";
+import { getExtraMigrationFiles } from "./migrationRunner/extraDirs";
 
 const isNodeTestRunnerChild = typeof process.env.NODE_TEST_CONTEXT === "string";
 
@@ -215,7 +217,9 @@ function isDeferredUnsupportedMigration(
  * Get all migration files sorted by version number.
  */
 function getMigrationFiles(): Array<{ version: string; name: string; path: string }> {
-  if (!fs.existsSync(MIGRATIONS_DIR)) return [];
+  // The extra directories are an independent set: a missing core directory must not
+  // make them vanish silently.
+  if (!fs.existsSync(MIGRATIONS_DIR)) return getExtraMigrationFiles();
 
   const files = fs
     .readdirSync(MIGRATIONS_DIR)
@@ -264,7 +268,13 @@ function getMigrationFiles(): Array<{ version: string; name: string; path: strin
     );
   }
 
-  return files;
+  // Extra directories registered via OMNIROUTE_EXTRA_MIGRATIONS_DIRS, appended
+  // AFTER the numeric set so a distribution's own schema always lands on top of
+  // the upstream one. Their versions are namespaced (`ee-134`), so they cannot
+  // collide with a numeric slot, and every downstream consumer here — the applied
+  // set, the gap reconciliation, the name-mismatch check — keys on the version
+  // string and needs no further change. Empty and filesystem-free when unset.
+  return [...files, ...getExtraMigrationFiles()];
 }
 
 function filterSupersededDuplicateMigrations(
@@ -455,6 +465,13 @@ function isSchemaAlreadyApplied(
       // exists the rebuild ran — skip re-executing the rename/copy/drop, which
       // would fail on the missing proxy_assignments_pre117 table.
       return hasColumn(db, "proxy_assignments", "position");
+    // Retroactive guard for the 135/136 renumber (#8523 landed onto slots already taken
+    // by #8908/#9515): a DB that ran these under the old numbers already has the column,
+    // and a bare ALTER TABLE ADD COLUMN would throw on the re-run under the new number.
+    case "137":
+      return hasColumn(db, "version_manager", "auto_restart_adopted");
+    case "138":
+      return hasColumn(db, "upstream_proxy_config", "fallback_backend");
     default:
       return false;
   }
@@ -883,10 +900,7 @@ export function runMigrations(db: SqliteAdapter, options?: { isNewDb?: boolean }
 
   // ── Safety Check 2: Mass-migration detection (abort if existing DB + many migrations) ──
   // Skip in test environments where fresh DBs legitimately have many pending migrations.
-  const isTestEnvironment =
-    process.env.NODE_ENV === "test" ||
-    process.env.VITEST !== undefined ||
-    (typeof process.argv !== "undefined" && process.argv.some((arg) => arg.includes("test")));
+  const isTestEnvironment = isAutomatedTestProcess();
 
   // #3416: resolve the threshold at call time so OMNIROUTE_MAX_PENDING_MIGRATIONS
   // can override the default (0 disables the check). The abort message below

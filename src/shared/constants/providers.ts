@@ -11,6 +11,7 @@ export interface ProviderRiskNoticeFields {
 }
 
 import { NOAUTH_PROVIDERS } from "./providers/noauth";
+export { supportsNoAuthProviderProxy } from "./providers/noauth";
 import { OAUTH_PROVIDERS } from "./providers/oauth";
 import { WEB_COOKIE_PROVIDERS, resolveWebProviderHost } from "./providers/web-cookie";
 export { resolveWebProviderHost };
@@ -31,10 +32,7 @@ export const FREE_APIKEY_PROVIDER_IDS = new Set([
   "qoder",
   "mimocode",
   "opencode",
-  // codebuddy-cn is OAuth-primary but the Tencent gateway also accepts a direct
-  // API key (Authorization: Bearer). Admit it through the same managed-provider
-  // gate so POST /api/providers accepts the dual-auth shape.
-  "codebuddy-cn",
+  "dahl",
   // auggie is a fully local, credential-less CLI passthrough (auth handled by
   // `auggie login` outside OmniRoute). Admitted here purely so POST /api/providers
   // accepts an optional connection row for display/priority/testStatus tracking —
@@ -44,6 +42,14 @@ export const FREE_APIKEY_PROVIDER_IDS = new Set([
 
 export function supportsApiKeyOnFreeProvider(providerId: unknown): boolean {
   return typeof providerId === "string" && FREE_APIKEY_PROVIDER_IDS.has(providerId);
+}
+
+// OAuth-primary providers that also accept a direct API key. Keep these out of
+// FREE_APIKEY_PROVIDER_IDS so the dashboard's primary action remains OAuth.
+const DUAL_AUTH_PROVIDER_IDS = new Set(["clinepass", "codebuddy-cn"]);
+
+export function supportsDualAuthProvider(providerId: unknown): boolean {
+  return typeof providerId === "string" && DUAL_AUTH_PROVIDER_IDS.has(providerId);
 }
 
 // Web / Cookie Providers
@@ -58,6 +64,8 @@ export const IMAGE_ONLY_PROVIDER_IDS = new Set([
   "black-forest-labs",
   "recraft",
   "topaz",
+  "segmind",
+  "freepik",
 ]);
 
 export const AGGREGATOR_PROVIDER_IDS = new Set([
@@ -70,6 +78,7 @@ export const AGGREGATOR_PROVIDER_IDS = new Set([
   "getgoapi",
   "laozhang",
   "vercel-ai-gateway",
+  "unorouter",
   "agentrouter",
   "thebai",
   "fenayai",
@@ -77,6 +86,12 @@ export const AGGREGATOR_PROVIDER_IDS = new Set([
   "poe",
   "chutes",
   "hackclub",
+  "freetheai",
+  "g4f-groq",
+  "g4f-gemini",
+  "g4f-pollinations",
+  "g4f-ollama",
+  "g4f-nvidia",
 ]);
 
 export const ENTERPRISE_CLOUD_PROVIDER_IDS = new Set([
@@ -105,12 +120,14 @@ export const VIDEO_PROVIDER_IDS = new Set([
   "replicate",
   "haiper",
   "leonardo",
+  "segmind",
+  "novita",
 ]);
 
 // IDE Providers: editors with built-in AI subscription (separate section in UI).
 // These providers live in OAUTH_PROVIDERS but render under "IDE Providers"
 // instead of "OAuth Providers" to avoid visual duplication.
-export const IDE_PROVIDER_IDS = new Set(["cursor", "zed", "trae"]);
+export const IDE_PROVIDER_IDS = new Set(["cursor", "zed", "trae", "raycast"]);
 
 export const EMBEDDING_RERANK_PROVIDER_IDS = new Set(["voyage-ai", "jina-ai"]);
 
@@ -160,17 +177,31 @@ export function isSelfHostedChatProvider(providerId: unknown): boolean {
   return typeof providerId === "string" && SELF_HOSTED_CHAT_PROVIDER_IDS.has(providerId);
 }
 
+// Providers with heterogeneous/no-key auth that don't fit the NOAUTH_PROVIDERS
+// registry (e.g. free-tier gateways where a key is accepted but not required).
+// Kept as a Set (not an || chain) to keep providerAllowsOptionalApiKey's
+// cyclomatic complexity flat as this list grows — see g4f.space (#6650).
+const EXPLICIT_OPTIONAL_APIKEY_PROVIDER_IDS = new Set([
+  "searxng-search",
+  "firecrawl",
+  "pollinations",
+  "copilot-web",
+  "hackclub",
+  "g4f-groq",
+  "g4f-gemini",
+  "g4f-pollinations",
+  "g4f-ollama",
+  "g4f-nvidia",
+  "huggingchat",
+  "gitlawb",
+  "gitlawb-gmi",
+]);
+
 export function providerAllowsOptionalApiKey(providerId: unknown): boolean {
   return (
     // ponytail: any noAuth provider auto-qualifies — no per-provider maintenance
     (typeof providerId === "string" && providerId in NOAUTH_PROVIDERS) ||
-    providerId === "searxng-search" ||
-    providerId === "pollinations" ||
-    providerId === "copilot-web" ||
-    providerId === "hackclub" ||
-    providerId === "huggingchat" ||
-    providerId === "gitlawb" ||
-    providerId === "gitlawb-gmi" ||
+    (typeof providerId === "string" && EXPLICIT_OPTIONAL_APIKEY_PROVIDER_IDS.has(providerId)) ||
     isLocalProvider(providerId) ||
     isSelfHostedChatProvider(providerId) ||
     isOpenAICompatibleProvider(providerId) ||
@@ -413,9 +444,25 @@ export const USAGE_SUPPORTED_PROVIDERS = [
   "nanogpt",
   "deepseek",
   "xiaomi-mimo",
+  "xiaomi-mimo-token-plan",
   "vertex",
   "vertex-partner",
   "codebuddy-cn",
+  // PromptQL playground credits (getCreditSummary → USD micros)
+  "promptql",
+  "pql",
+  // Adobe Firefly web (cookie/JWT as apikey) — GET firefly.adobe.io/v1/credits/balance
+  "adobe-firefly",
+  "firefly",
+  "hyperagent",
+  "ha",
+  // xAI OAuth (Grok) weekly quota (id + public alias, same pattern as ha/agy)
+  "xai-oauth",
+  "xao",
+  // Grok Build subscription, billing credits, and auto top-up status
+  "grok-cli",
+  // Firecrawl team credits (GET /v2/team/credit-usage)
+  "firecrawl",
 ];
 
 // ── Zod validation at module load (Phase 7.2) ──
