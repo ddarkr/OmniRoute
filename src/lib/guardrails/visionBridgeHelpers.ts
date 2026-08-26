@@ -1,10 +1,14 @@
 /**
  * Vision Bridge helper functions for image processing.
  */
+import { detectMediaParts, type MediaPart } from "@omniroute/open-sse/utils/mediaParts";
+import { normalizeDataUri } from "@omniroute/open-sse/utils/imageNormalize";
 import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
 import { getRuntimePorts } from "@/lib/runtime/ports";
 import { resolveSelfLoopBearer } from "@/shared/middleware/chatBodyAdmission";
 import { getBestVisionModel, getFallbackModels, recordLatency } from "./visionBridgeRouter";
+import { REGISTRY } from "@omniroute/open-sse/config/providers";
+import { fetch as undiciFetch } from "undici";
 /**
  * Provider to environment variable mapping for API key resolution.
  */
@@ -13,6 +17,27 @@ const PROVIDER_API_KEY_MAP: Record<string, string> = {
   google: "GOOGLE_API_KEY",
   openai: "OPENAI_API_KEY",
 };
+
+// Providers whose wire format is Anthropic Messages ("claude"). Anthropic
+// accepts `source: { type: "url" }` for images, but most claude-format backends
+// (MiniMax, Z.AI, …) do NOT — they reject remote URLs (MiniMax: 403 code
+// 2013). The vision bridge must deliver images as base64 for these targets,
+// both in the describe self-loop and in the rerouted payload.
+const CLAUDE_WIRE_PROVIDERS = new Set<string>(
+  Object.entries(REGISTRY)
+    .filter(([, entry]) => entry.format === "claude")
+    .map(([id]) => id.toLowerCase())
+);
+
+/**
+ * True when `provider/model` targets a Claude-Messages wire format backend
+ * that cannot ingest remote image URLs and needs base64 instead.
+ */
+export function isClaudeWireFormatModel(model: string | null | undefined): boolean {
+  if (!model || typeof model !== "string") return false;
+  const provider = model.includes("/") ? model.split("/")[0].trim().toLowerCase() : "";
+  return CLAUDE_WIRE_PROVIDERS.has(provider);
+}
 
 /**
  * Resolve API key based on model provider (issue #2232).
@@ -43,6 +68,43 @@ export function resolveProviderApiKey(model: string, explicitKey?: string): stri
   const provider = model.includes("/") ? model.split("/")[0] : "";
   const envVar = PROVIDER_API_KEY_MAP[provider] || "OPENAI_API_KEY";
   return process.env[envVar] || "";
+}
+
+let selfLoopKeyPromise: Promise<string> | null = null;
+
+/**
+ * Resolve a real API key for the OmniRoute SELF-LOOP describe call.
+ *
+ * The `sk_omniroute` sentinel works only when REQUIRE_API_KEY is disabled; on
+ * REQUIRE_API_KEY instances it is rejected with 401 "Missing API key", which
+ * silently breaks every vision-bridge describe. Priority:
+ *   1. VISION_BRIDGE_API_KEY env (already handled by resolveProviderApiKey —
+ *      kept here for the injected-resolver test path).
+ *   2. Injected resolver (tests) or the DB-backed `getOrCreateApiKey()` —
+ *      memoized so at most one key is created per process.
+ *   3. `sk_omniroute` as a final fallback (local mode without auth).
+ */
+export async function resolveSelfLoopApiKey(resolver?: () => Promise<string>): Promise<string> {
+  const envKey = (process.env.VISION_BRIDGE_API_KEY || "").trim();
+  if (envKey) return envKey;
+  if (resolver) {
+    const key = (await resolver()).trim();
+    if (key) return key;
+    return "sk_omniroute";
+  }
+  if (!selfLoopKeyPromise) {
+    selfLoopKeyPromise = (async () => {
+      try {
+        const { getOrCreateApiKey } = await import("@/shared/services/apiKeyResolver");
+        const key = await getOrCreateApiKey();
+        if (typeof key === "string" && key.trim().length > 0) return key.trim();
+      } catch {
+        /* fall through */
+      }
+      return "sk_omniroute";
+    })();
+  }
+  return selfLoopKeyPromise;
 }
 
 /**
@@ -100,7 +162,9 @@ export interface RequestMessage {
 
 export type RequestContentPart =
   | { type: "text"; text: string }
+  | { type: "input_text"; text: string }
   | { type: "image_url"; image_url: { url: string; detail?: string } }
+  | { type: "input_image"; image_url: string; detail?: string }
   | {
       type: "image";
       source: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string };
@@ -118,53 +182,99 @@ export type RequestContentPart =
  * vision-bridge guardrail, so the image was silently dropped by a text-only
  * executor instead of being described.
  */
+/**
+ * Shapes `replaceImageParts` knows how to splice: top-level content parts
+ * whose `type` is `image_url`, `image`, or `input_image`. Everything else the
+ * detector reports (nested hits, `data_uri_string`, `image_indicator`) is
+ * combo-filter material only — extracting it would desync the positional
+ * description consumption in visionBridge (descriptions would shift onto the
+ * wrong images).
+ */
+const REPLACEABLE_IMAGE_SHAPES: ReadonlySet<MediaPart["shape"]> = new Set([
+  "image_url",
+  "image_base64",
+  "image_source_url",
+  "input_image",
+]);
+
 export function extractImageParts(messages: RequestMessage[]): ImagePart[] {
-  const results: ImagePart[] = [];
+  // Delegates to the unified detector (open-sse/utils/mediaParts.ts) so the
+  // guardrail and the combo compatibility filter share one source of truth.
+  // Extraction is ALLOWLISTED to top-level (non-nested) parts whose shape
+  // replaceImageParts can splice back — the extract↔replace contract: every
+  // extracted part MUST be replaceable, in the same order, or the positional
+  // descriptions shift onto the wrong images.
+  return detectMediaParts(messages)
+    .filter((p) => p.kind === "image" && !p.nested && REPLACEABLE_IMAGE_SHAPES.has(p.shape))
+    .map((p) => ({
+      messageIndex: p.messageIndex,
+      partIndex: p.partIndex,
+      imageUrl: p.ref,
+      imageType:
+        p.shape === "image_base64" ? "image" : p.shape === "image_source_url" ? "url" : "image_url",
+    }));
+}
 
-  if (!Array.isArray(messages)) {
-    return results;
-  }
+// Undici fetch with a browser-ish User-Agent: Wikimedia (and other CDNs)
+// reject requests without a UA with HTTP 400, silently breaking remote image
+// downloads in the describe path.
+const VISION_BRIDGE_UA_FETCH: typeof fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+  undiciFetch(input as string | URL, {
+    ...(init as Parameters<typeof undiciFetch>[1]),
+    headers: {
+      "user-agent": "omniroute-vision-bridge",
+      ...((init?.headers as Record<string, string> | undefined) ?? {}),
+    },
+  })) as unknown as typeof fetch;
 
-  for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
-    const message = messages[msgIdx];
-    if (!message || !Array.isArray(message.content)) {
-      continue;
-    }
+/**
+ * Resolve every image part in the body to a base64 data URI when the target
+ * model speaks the Claude wire format (remote URLs unsupported by most
+ * claude-format backends, e.g. MiniMax 403 2013). Fail-open: an image that
+ * cannot be fetched is left untouched.
+ */
+export async function ensureBase64ImagesForClaudeWire(
+  body: RequestBody,
+  model: string,
+  fetchImpl: typeof fetch = VISION_BRIDGE_UA_FETCH
+): Promise<RequestBody> {
+  if (!isClaudeWireFormatModel(model)) return body;
+  const parts = extractImageParts(body.messages as RequestMessage[]);
+  if (parts.length === 0) return body;
 
-    for (let partIdx = 0; partIdx < message.content.length; partIdx++) {
-      const part = message.content[partIdx];
+  const resolved = await Promise.all(
+    parts.map(async (part) => {
+      const normalized = resolveImageAsDataUri(part.imageUrl);
+      if (normalized.startsWith("data:")) return null; // already base64
+      try {
+        return await fetchRemoteImageAsDataUri(normalized, new AbortController().signal, fetchImpl);
+      } catch {
+        return null; // fail-open: keep the original part
+      }
+    })
+  );
 
-      if (part?.type === "image_url" && part.image_url?.url) {
-        results.push({
-          messageIndex: msgIdx,
-          partIndex: partIdx,
-          imageUrl: part.image_url.url,
-          imageType: "image_url",
-        });
-      } else if (part?.type === "image" && part.source?.type === "base64") {
-        const { media_type, data } = part.source;
-        const dataUri = `data:${media_type};base64,${data}`;
-        results.push({
-          messageIndex: msgIdx,
-          partIndex: partIdx,
-          imageUrl: dataUri,
-          imageType: "image",
-        });
-      } else if (part?.type === "image" && part.source?.type === "url") {
-        const url = part.source.url;
-        if (url) {
-          results.push({
-            messageIndex: msgIdx,
-            partIndex: partIdx,
-            imageUrl: url,
-            imageType: "url",
-          });
-        }
+  // Map sequential image index → resolved data URI (null = keep original).
+  const byIndex = new Map<number, string>();
+  parts.forEach((part, i) => {
+    if (resolved[i]) byIndex.set(i, resolved[i] as string);
+  });
+  if (byIndex.size === 0) return body;
+
+  const result = structuredClone(body) as RequestBody;
+  let imageIndex = 0;
+  for (const message of result.messages ?? []) {
+    if (!message || !Array.isArray(message.content)) continue;
+    for (const part of message.content as RequestContentPart[]) {
+      if (part.type !== "image_url" && part.type !== "image") continue;
+      const dataUri = byIndex.get(imageIndex);
+      imageIndex++;
+      if (dataUri) {
+        (part as { image_url?: { url: string } }).image_url = { url: dataUri };
       }
     }
   }
-
-  return results;
+  return result;
 }
 
 /**
@@ -193,16 +303,31 @@ export function resolveImageAsDataUri(imageUrl: string): string {
   return `data:image/png;base64,${imageUrl}`;
 }
 
-async function fetchRemoteImageAsDataUri(imageUrl: string, signal: AbortSignal): Promise<string> {
-  const remoteImage = await fetchRemoteImage(imageUrl, { signal });
+async function fetchRemoteImageAsDataUri(
+  imageUrl: string,
+  signal: AbortSignal,
+  fetchImpl: typeof fetch = VISION_BRIDGE_UA_FETCH
+): Promise<string> {
+  const remoteImage = await fetchRemoteImage(imageUrl, {
+    signal,
+    // Bypass the runtime's hooked global fetch (ProxyFetch) — a dead local
+    // proxy (e.g. 127.0.0.1:8317) would otherwise break the download.
+    fetchImpl,
+  });
   const mediaType = remoteImage.contentType.split(";")[0]?.trim() || "image/png";
-  return `data:${mediaType};base64,${remoteImage.buffer.toString("base64")}`;
+  const dataUri = `data:${mediaType};base64,${remoteImage.buffer.toString("base64")}`;
+  // Downscale to the long-edge cap before handing the image to the vision
+  // model self-call — scoped to this bridge-fetched image only, never the
+  // user's raw passthrough payload (opt-in principle, HR#20).
+  // `normalizeDataUri` never throws and is a passthrough for non-image bytes.
+  return normalizeDataUri(dataUri);
 }
 
 async function normalizeVisionImageInput(
   imageInput: string,
   isAnthropic: boolean,
-  signal: AbortSignal
+  signal: AbortSignal,
+  fetchImpl?: typeof fetch
 ): Promise<string> {
   const normalizedImage = resolveImageAsDataUri(imageInput);
 
@@ -210,7 +335,7 @@ async function normalizeVisionImageInput(
     isAnthropic &&
     (normalizedImage.startsWith("http://") || normalizedImage.startsWith("https://"))
   ) {
-    return fetchRemoteImageAsDataUri(normalizedImage, signal);
+    return fetchRemoteImageAsDataUri(normalizedImage, signal, fetchImpl);
   }
 
   return normalizedImage;
@@ -221,6 +346,27 @@ export interface VisionModelConfig {
   prompt: string;
   timeoutMs: number;
   maxImages: number;
+  /** Route catalog models through OmniRoute so provider connections remain authoritative. */
+  routeThroughOmniRoute?: boolean;
+  /** Optional parent deadline/abort propagated by multi-step media bridges. */
+  signal?: AbortSignal;
+  /** Injectable fetch (tests). Defaults to undici fetch to bypass the runtime's hooked global fetch. */
+  fetchImpl?: typeof fetch;
+  /** Receives the actual successful model while the public return value remains a string. */
+  onModelUsed?: (model: string) => void;
+}
+
+/** Task-aware focus hint (codex-vision-proxy pattern): steer the description
+ * toward what the user actually asked, instead of a generic caption. */
+export function composeVisionPrompt(
+  basePrompt: string,
+  lastUserText: string | undefined,
+  taskAware: boolean
+): string {
+  const text = (lastUserText ?? "").trim();
+  if (!taskAware || !text) return basePrompt;
+  const hint = text.length > 500 ? `${text.slice(0, 500)}…` : text;
+  return `${basePrompt}\n\nThe user asked: "${hint}". Focus your description on what is relevant to answering this, and transcribe any text visible in the image.`;
 }
 
 /**
@@ -235,6 +381,10 @@ export async function callVisionModel(
   routerConfig?: Partial<import("./visionBridgeRouter").VisionBridgeRouterConfig>,
   deps?: import("./visionBridgeRouter").VisionBridgeRouterDeps
 ): Promise<string> {
+  if (config.signal?.aborted) {
+    throw new Error("Vision model call aborted");
+  }
+
   // Auto-select the best vision model. `deps` is the router's existing
   // injectable credential-check seam — without forwarding it, tests (and any
   // embedder) cannot keep model selection away from the live connections DB.
@@ -258,6 +408,9 @@ export async function callVisionModel(
   const maxAttempts = Math.min(modelsToTry.length, routerConfig?.maxFallbackAttempts ?? 3);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (config.signal?.aborted) {
+      throw lastError ?? new Error("Vision model call aborted");
+    }
     const currentModel = modelsToTry[attempt];
     const attemptStart = Date.now();
     try {
@@ -267,10 +420,18 @@ export async function callVisionModel(
         apiKey
       );
       recordLatency(currentModel, Date.now() - attemptStart, true);
+      try {
+        config.onModelUsed?.(currentModel);
+      } catch {
+        // Observability callbacks must never turn a successful caption into a retry.
+      }
       return result;
     } catch (error) {
       recordLatency(currentModel, Date.now() - attemptStart, false);
       lastError = error instanceof Error ? error : new Error(String(error));
+      if (config.signal?.aborted) {
+        throw lastError;
+      }
       // Continue to next model on failure
     }
   }
@@ -365,6 +526,11 @@ function parseSseVisionBody(rawBody: string): unknown {
     if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length > 0) {
       reasoningParts.push(delta.reasoning_content);
     }
+    // opencode-routed gateways (e.g. mimo-v2.5-free) stream chain-of-thought in
+    // `delta.reasoning` instead of `reasoning_content` (#6623).
+    if (typeof delta?.reasoning === "string" && delta.reasoning.length > 0) {
+      reasoningParts.push(delta.reasoning);
+    }
 
     // Some providers put a full message (not a delta) in the final chunk.
     const message = choice?.message as Record<string, unknown> | undefined;
@@ -373,6 +539,9 @@ function parseSseVisionBody(rawBody: string): unknown {
     }
     if (typeof message?.reasoning_content === "string" && message.reasoning_content.length > 0) {
       reasoningParts.push(message.reasoning_content);
+    }
+    if (typeof message?.reasoning === "string" && message.reasoning.length > 0) {
+      reasoningParts.push(message.reasoning);
     }
 
     // Anthropic-style streaming: `content_block_delta` with `delta.text`.
@@ -441,13 +610,17 @@ async function readVisionResponseBody(response: Response): Promise<unknown> {
 
 /**
  * Extract the description text from an OpenAI-compatible vision response.
- * Falls back to `reasoning_content` when `content` is empty — reasoning models
- * (e.g. xiaomi/mimo-v2.5) can exhaust `max_tokens` on chain-of-thought and
- * return `content: null` with a complete analysis in `reasoning_content`.
+ * Falls back to `reasoning_content` then `reasoning` when `content` is empty —
+ * reasoning models (e.g. xiaomi/mimo-v2.5, opencode/mimo-v2.5-free) can exhaust
+ * `max_tokens` on chain-of-thought and return `content: null` with a complete
+ * analysis in a reasoning field. opencode-routed gateways name that field
+ * `reasoning` rather than `reasoning_content` (#6623 / #10809).
  */
 function extractOpenAICompatibleContent(data: unknown): string {
   const record = data as {
-    choices?: Array<{ message?: { content?: unknown; reasoning_content?: unknown } }>;
+    choices?: Array<{
+      message?: { content?: unknown; reasoning_content?: unknown; reasoning?: unknown };
+    }>;
     error?: { message?: string };
   } | null;
 
@@ -464,7 +637,11 @@ function extractOpenAICompatibleContent(data: unknown): string {
   if (content) return content;
 
   const reasoning =
-    typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
+    typeof message?.reasoning_content === "string"
+      ? message.reasoning_content.trim()
+      : typeof message?.reasoning === "string"
+        ? message.reasoning.trim()
+        : "";
   if (reasoning) return reasoning;
 
   throw new Error("Vision API returned empty or invalid response");
@@ -480,20 +657,34 @@ async function callVisionModelSingle(
 ): Promise<string> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), config.timeoutMs);
+  const signal = config.signal
+    ? AbortSignal.any([config.signal, controller.signal])
+    : controller.signal;
 
   // Resolve API key based on provider
   const resolvedApiKey = resolveProviderApiKey(config.model, apiKey);
+  // Production callers (VisionBridgeGuardrail) inject undici fetch to bypass
+  // the runtime's hooked global fetch (ProxyFetch). Defaults to globalThis.fetch
+  // so existing unit tests that mock it keep working.
+  const fetchImpl = config.fetchImpl ?? globalThis.fetch;
 
-  // Detect provider from model identifier
-  const isAnthropic = config.model.startsWith("anthropic/");
+  // Detect provider from model identifier. Claude-wire targets (minimax, zai,
+  // …) cannot ingest remote image URLs — normalize to base64 so the self-loop
+  // body reaches the backend as a data URI (the OpenAI→claude translator only
+  // preserves data URIs as base64; remote URLs become source.url which these
+  // backends reject).
+  const routeThroughOmniRoute = config.routeThroughOmniRoute === true;
+  const isAnthropic = !routeThroughOmniRoute && config.model.startsWith("anthropic/");
+  const requiresBase64 = isAnthropic || isClaudeWireFormatModel(config.model);
 
   try {
     // Extract model name from provider/model format
     const modelName = config.model.includes("/") ? config.model.split("/")[1] : config.model;
     const normalizedImageInput = await normalizeVisionImageInput(
       imageDataUri,
-      isAnthropic,
-      controller.signal
+      requiresBase64,
+      signal,
+      fetchImpl
     );
 
     let response: Response;
@@ -512,9 +703,9 @@ async function callVisionModelSingle(
         base64Data = matches[2];
       }
 
-      response = await fetch(`${anthropicBaseUrl}/v1/messages`, {
+      response = await fetchImpl(`${anthropicBaseUrl}/v1/messages`, {
         method: "POST",
-        signal: controller.signal,
+        signal,
         headers: {
           "x-api-key": resolvedApiKey,
           "anthropic-version": "2023-06-01",
@@ -549,22 +740,26 @@ async function callVisionModelSingle(
       // VISION_BRIDGE_BASE_URL so the vision-bridge call can be routed through
       // OmniRoute itself or any other OpenAI-compatible endpoint instead of
       // hardcoded api.openai.com.
-      const baseUrl = resolveVisionBridgeBaseUrl(config.model);
+      const baseUrl = routeThroughOmniRoute
+        ? `http://localhost:${getRuntimePorts().port}/v1`
+        : resolveVisionBridgeBaseUrl(config.model);
 
       // When routing through the OmniRoute self-loop (non-standard provider),
       // keep the full provider-prefixed model ID so OmniRoute can resolve the
       // correct provider backend. Only strip the prefix for direct OpenAI calls.
       const useFullModelId =
-        baseUrl.startsWith("http://localhost") &&
-        config.model.includes("/") &&
-        !config.model.startsWith("openai/");
+        routeThroughOmniRoute ||
+        (baseUrl.startsWith("http://localhost") &&
+          config.model.includes("/") &&
+          !config.model.startsWith("openai/"));
       const requestModel = useFullModelId ? config.model : modelName;
 
       // Build headers with optional recursion guard for self-loop calls.
       // When routing through OmniRoute's own API, omit the vision-bridge
       // guardrail on the sub-request to prevent infinite recursion.
-      // Use sk_omniroute as fallback for self-loop if no API key is resolved.
-      const selfLoopApiKey = resolvedApiKey || "sk_omniroute";
+      // Use a real DB-backed key for self-loop (sk_omniroute is rejected by
+      // REQUIRE_API_KEY instances with 401 "Missing API key").
+      const selfLoopApiKey = resolvedApiKey || (await resolveSelfLoopApiKey());
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         // Explicit JSON opt-in: without `Accept: application/json` OmniRoute's
@@ -576,7 +771,9 @@ async function callVisionModelSingle(
         Authorization: `Bearer ${selfLoopApiKey}`,
       };
       if (useFullModelId) {
-        headers["x-omniroute-disabled-guardrails"] = "vision-bridge";
+        headers["x-omniroute-disabled-guardrails"] = routeThroughOmniRoute
+          ? "vision-bridge,video-bridge"
+          : "vision-bridge";
         // Internal self-loop sub-request: the parent request already holds the
         // single heavyweight admission lease (`CHAT_MAX_HEAVY_IN_FLIGHT=1`), so a
         // large base64-image describe body would be rejected with 503
@@ -585,6 +782,9 @@ async function callVisionModelSingle(
         // `sk_omniroute` sentinel OR the operator-configured env key), so
         // external clients cannot use it to bypass admission.
         headers["x-omniroute-admission-bypass"] = "internal";
+        // The compression pipeline must not touch the image payload of the
+        // self-loop describe call (stacked RTK/Caveman can mangle data URIs).
+        headers["x-omniroute-compression"] = "off";
         // The admission bypass honors the env key when set (REQUIRE_API_KEY=true
         // deployments) and the `sk_omniroute` sentinel otherwise. Force the same
         // resolved credential so the bypass holds even when a real vision key is
@@ -592,9 +792,9 @@ async function callVisionModelSingle(
         headers["Authorization"] = `Bearer ${resolveSelfLoopBearer()}`;
       }
 
-      response = await fetch(`${baseUrl}/chat/completions`, {
+      response = await fetchImpl(`${baseUrl}/chat/completions`, {
         method: "POST",
-        signal: controller.signal,
+        signal,
         headers,
         body: JSON.stringify({
           model: requestModel,
@@ -604,10 +804,26 @@ async function callVisionModelSingle(
               role: "user",
               content: [
                 {
+                  // Global, not OpenCode-scoped: this is OmniRoute's own internal
+                  // describe self-loop (VisionBridgeGuardrail), called for every
+                  // caller/provider when the target model lacks vision support —
+                  // there is no client-identity signal at this layer to gate on
+                  // (unlike the OpenCode-only `isOpencodeClient` default in
+                  // `chatCore/upstreamBody.ts`, which forwards the *caller's own*
+                  // image_url.detail and is deliberately scoped). "high" is
+                  // requested unconditionally because the describe prompt asks
+                  // the vision model to transcribe visible text
+                  // (`modalityBridgeVisionTaskAware`, see docs/security/GUARDRAILS.md)
+                  // — low-detail sampling degrades OCR accuracy for every
+                  // describe call, not just OpenCode-originated ones. This path
+                  // only affects the OpenAI-compatible wire format branch; the
+                  // Anthropic branch above has no `detail` concept and is
+                  // unaffected (see the "unaffected for Anthropic" compat
+                  // assertion in visionBridgeHelpers.callVisionModel.test.ts).
                   type: "image_url",
                   image_url: {
                     url: normalizedImageInput,
-                    detail: "low",
+                    detail: "high",
                   },
                 },
                 { type: "text", text: config.prompt },
@@ -659,7 +875,9 @@ async function callVisionModelSingle(
     clearTimeout(timeoutId);
 
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Vision model call timed out");
+      throw new Error(
+        config.signal?.aborted ? "Vision model call aborted" : "Vision model call timed out"
+      );
     }
 
     throw error;
@@ -669,6 +887,7 @@ async function callVisionModelSingle(
 export interface RequestBody {
   model?: string;
   messages?: RequestMessage[];
+  input?: RequestMessage[];
   [key: string]: unknown;
 }
 
@@ -688,14 +907,23 @@ export function replaceImageParts(
 
   const result = structuredClone(body) as RequestBody;
 
-  if (!Array.isArray(result.messages)) {
+  const usesResponsesInput = !Array.isArray(result.messages) && Array.isArray(result.input);
+  const requestMessages = Array.isArray(result.messages)
+    ? result.messages
+    : usesResponsesInput
+      ? result.input
+      : null;
+
+  if (!requestMessages) {
     return result;
   }
 
+  const replacementTextType: "text" | "input_text" = usesResponsesInput ? "input_text" : "text";
+
   let descriptionIndex = 0;
 
-  for (let msgIdx = 0; msgIdx < result.messages.length; msgIdx++) {
-    const message = result.messages[msgIdx];
+  for (let msgIdx = 0; msgIdx < requestMessages.length; msgIdx++) {
+    const message = requestMessages[msgIdx];
     if (!message || !Array.isArray(message.content)) {
       continue;
     }
@@ -703,7 +931,12 @@ export function replaceImageParts(
     const newContent: RequestContentPart[] = [];
 
     for (const part of message.content) {
-      if (part?.type === "image_url" || part?.type === "image") {
+      // `input_image` (Responses API) is read through a widened type: it is
+      // not part of the historical RequestContentPart union but MUST be
+      // replaceable — extractImageParts allowlists it, and every extracted
+      // part needs a matching splice here (extract↔replace contract).
+      const partType = (part as { type?: string } | null | undefined)?.type;
+      if (partType === "image_url" || partType === "image" || partType === "input_image") {
         if (descriptionIndex < descriptions.length) {
           const description = descriptions[descriptionIndex];
           descriptionIndex++;
@@ -712,7 +945,10 @@ export function replaceImageParts(
             // image so a vision-capable upstream can still process it.
             newContent.push(part as RequestContentPart);
           } else {
-            newContent.push({ type: "text", text: description });
+            newContent.push({
+              type: replacementTextType,
+              text: description,
+            } as RequestContentPart);
           }
         }
       } else {

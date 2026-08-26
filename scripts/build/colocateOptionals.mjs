@@ -4,31 +4,32 @@
  * OmniRoute — Co-locate the LLMLingua-2 optional dependency closure into the standalone bundle.
  *
  * The compression "ultra" SLM tier (PR #4257) runs `@atjsh/llmlingua-2` +
- * `@huggingface/transformers` + `@tensorflow/tfjs` + `js-tiktoken` inside a worker thread
+ * `@huggingface/transformers` + `js-tiktoken` inside a worker thread
  * (`open-sse/services/compression/engines/llmlingua/onnxWorker.js`, shipped under `dist/`). These
  * are `optionalDependencies`: npm installs them into the ROOT `node_modules` on
  * `--include=optional`, but the Next.js standalone trace bundles ONLY `@huggingface/transformers`
- * (3.5.2, pinned) into `dist/node_modules` — it does NOT trace the optional, dynamically-imported
+ * (4.2.0, pinned) into `dist/node_modules` — it does NOT trace the optional, dynamically-imported
  * SLM packages.
  *
  * ## Why this matters (the instance-split bug)
  *
  * The worker lives under `dist/`, so its `import("@huggingface/transformers")` resolves
- * `dist/node_modules/@huggingface/transformers` (3.5.2) and the worker sets the model `cacheDir`
+ * `dist/node_modules/@huggingface/transformers` (4.2.0) and the worker sets the model `cacheDir`
  * on THAT instance's `env`. But its `import("@atjsh/llmlingua-2")` walks past `dist/node_modules`
  * (no `@atjsh` there) up to the ROOT `node_modules`, and llmlingua-2's own
  * `import("@huggingface/transformers")` then resolves the ROOT transformers — a DIFFERENT instance.
  * The `cacheDir`/`localModelPath` config the worker set never reaches the instance llmlingua-2
  * actually uses, so the local model under `DATA_DIR/models/llmlingua` is never found and the SLM
- * tier silently fails-open (no compression). Worse, if the root transformers is a 4.x line,
- * llmlingua-2 throws on a tokenizer-API change (`decoder.decode` is undefined).
+ * tier silently fails-open (no compression). (Before `@atjsh/llmlingua-2@2.0.5` a root
+ * transformers on the 4.x line also made llmlingua-2 throw on a tokenizer-API change
+ * — `decoder.decode` is undefined; 2.0.5+ supports both v3 and v4.)
  *
  * ## The fix
  *
  * Co-locate the SLM optional dependency CLOSURE from the root `node_modules` into
- * `dist/node_modules` (NO-CLOBBER, so the pinned `dist` transformers 3.5.2 / onnxruntime / sharp
+ * `dist/node_modules` (NO-CLOBBER, so the pinned `dist` transformers 4.2.0 / onnxruntime / sharp
  * stay). Then the worker resolves `@atjsh/llmlingua-2` AND `@huggingface/transformers` from the
- * SAME `dist/node_modules` — a single 3.5.2 instance — so the env config applies and the local
+ * SAME `dist/node_modules` — a single 4.2.0 instance — so the env config applies and the local
  * model loads.
  *
  * `@huggingface/transformers` is intentionally NOT a closure seed: it is a PEER of
@@ -46,14 +47,15 @@
  * fail-open, so this never throws into the install.
  */
 
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join, sep } from "node:path";
 
 /**
  * Entry packages of the SLM optional stack (the closure roots). `@huggingface/transformers` is
  * deliberately absent — it is the pinned instance already present in `dist/node_modules`.
  */
-export const SEED_PACKAGES = ["@atjsh/llmlingua-2", "@tensorflow/tfjs", "js-tiktoken"];
+export const SEED_PACKAGES = ["@atjsh/llmlingua-2", "js-tiktoken"];
 
 /**
  * Compute the transitive dependency closure of `seeds` by walking each package's `dependencies` +
@@ -96,18 +98,33 @@ export function computeDependencyClosure(nodeModulesDir, seeds = SEED_PACKAGES) 
   return closure;
 }
 
-/** Return true when every source path is represented in the destination tree. */
-function hasCompleteTree(sourceDir, destinationDir) {
-  if (!existsSync(destinationDir)) return false;
-
-  for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
-    const sourcePath = join(sourceDir, entry.name);
-    const destinationPath = join(destinationDir, entry.name);
-    if (!existsSync(destinationPath)) return false;
-    if (entry.isDirectory() && !hasCompleteTree(sourcePath, destinationPath)) return false;
+/**
+ * A package in the target tree counts as PRESENT only when its entrypoint
+ * resolves from inside that tree — the same contract the Dockerfile's
+ * post-build guard enforces. Next's file tracing can materialize a package
+ * PARTIALLY (the package.json lands, the files its `main` points at do not),
+ * and a directory-level `existsSync` check then skips the package forever
+ * while the runtime dies with "Cannot find module <pkg>/dist/index.js".
+ *
+ * @param {string} targetNodeModulesDir
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isPackageIntact(targetNodeModulesDir, name) {
+  if (!existsSync(join(targetNodeModulesDir, name))) return false;
+  try {
+    const probe = createRequire(
+      join(targetNodeModulesDir, "__colocate_probe__.js")
+    );
+    const resolved = probe.resolve(name);
+    // A resolution that walked past the target into an ancestor tree does not
+    // prove the target copy is usable.
+    const realTarget = realpathSync(targetNodeModulesDir);
+    const realResolved = realpathSync(resolved);
+    return realResolved.startsWith(realTarget + sep);
+  } catch {
+    return false;
   }
-
-  return true;
 }
 
 /**
@@ -118,10 +135,9 @@ function hasCompleteTree(sourceDir, destinationDir) {
  * postinstall path. Standalone builders, including Docker, may provide
  * `targetNodeModulesDir`.
  *
- * Packages already present in the destination are merged without overwriting
- * existing files. This preserves pinned standalone dependency instances while
- * repairing hollow packages emitted by the Next.js tracer and filling dynamically
- * imported packages that it omitted entirely.
+ * Packages already present in the destination are never overwritten. This
+ * preserves the standalone bundle's pinned dependency instances while filling
+ * dynamically imported packages that Next.js did not trace.
  *
  * @param {{
  *   rootDir: string,
@@ -155,13 +171,12 @@ export function colocateLlmlinguaOptionals({
 
   const closure = computeDependencyClosure(rootNm, seeds);
 
-  // A package directory alone does not prove the standalone trace is complete:
-  // Next.js can emit a hollow package containing only package.json. Always walk
-  // the closure and merge missing payload files without overwriting traced files.
-
+  // Check the complete closure rather than only the entry package, and judge
+  // presence by entrypoint integrity — a partially traced directory (see
+  // isPackageIntact) must still receive its missing files.
   if (
     closure.length > 0 &&
-    closure.every((name) => hasCompleteTree(join(rootNm, name), join(targetNm, name)))
+    closure.every((name) => isPackageIntact(targetNm, name))
   ) {
     return { skipped: true, reason: "already co-located" };
   }
@@ -170,16 +185,19 @@ export function colocateLlmlinguaOptionals({
 
   for (const name of closure) {
     const dest = join(targetNm, name);
-    if (hasCompleteTree(join(rootNm, name), dest)) continue;
+    if (isPackageIntact(targetNm, name)) continue;
 
     try {
       mkdirSync(dirname(dest), { recursive: true });
+      // force:false merges into a partially traced directory: files the trace
+      // already materialized are kept, missing ones (the package payload) are
+      // filled in from the root tree.
       cpSync(join(rootNm, name), dest, {
         recursive: true,
         force: false,
         errorOnExist: false,
       });
-      copied += 1;
+      copied++;
     } catch (err) {
       log(`  ⚠️  LLMLingua optional co-location failed for ${name}: ${err.message}`);
     }
