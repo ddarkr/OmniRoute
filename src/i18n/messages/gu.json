@@ -6254,13 +6254,13 @@
       "galadriel": "API કી વડે Galadriel ને કનેક્ટ કરો.",
       "predibase": "$25 મફત ટ્રાયલ ક્રેડિટ્સ (30-દિવસની માન્યતા)",
       "chenzk": "chenzk.top પર લાઇવ મોડલ કેટલોગ સાથે OpenAI-સુસંગત ગેટવે.",
-      "magnific": "Freepik ના Mystic API વડે છબીઓ જનરેટ કરો.",
+      "magnific": "Magnific ના Mystic API વડે છબીઓ જનરેટ કરો.",
       "freetheai": "પાસથ્રુ મોડલ સપોર્ટ સાથે મફત OpenAI-સુસંગત ગેટવે.",
-      "g4f-gemini": "Gemini માટે મફત નો-કી g4f.space રિવર્સ પ્રોક્સી, પ્રતિ મિનિટ 5 વિનંતીઓ સુધી મર્યાદિત.",
-      "g4f-groq": "Groq માટે મફત નો-કી g4f.space રિવર્સ પ્રોક્સી, પ્રતિ મિનિટ 5 વિનંતીઓ સુધી મર્યાદિત.",
-      "g4f-nvidia": "NVIDIA NIM માટે મફત નો-કી g4f.space રિવર્સ પ્રોક્સી, પ્રતિ મિનિટ 5 વિનંતીઓ સુધી મર્યાદિત.",
-      "g4f-ollama": "g4f.space તરફથી મફત નો-કી હોસ્ટ કરેલ Ollama ગેટવે, પ્રતિ મિનિટ 5 વિનંતીઓ સુધી મર્યાદિત.",
-      "g4f-pollinations": "Pollinations માટે મફત નો-કી g4f.space રિવર્સ પ્રોક્સી, પ્રતિ મિનિટ 5 વિનંતીઓ સુધી મર્યાદિત.",
+      "g4f-gemini": "Gemini માટેનું દૂરસ્થ g4f.space ગેટવે. અનામી ઍક્સેસ માટે g4f.dev/chat પરથી પ્રૂફ-ઓફ-વર્ક ક્રેડિટ અથવા g4f.dev/members.html પરથી સભ્ય API કી જરૂરી છે; મર્યાદાઓ બદલાય છે.",
+      "g4f-groq": "Groq માટેનું દૂરસ્થ g4f.space ગેટવે. અનામી ઍક્સેસ માટે g4f.dev/chat પરથી પ્રૂફ-ઓફ-વર્ક ક્રેડિટ અથવા g4f.dev/members.html પરથી સભ્ય API કી જરૂરી છે; મર્યાદાઓ બદલાય છે.",
+      "g4f-nvidia": "NVIDIA NIM માટેનું દૂરસ્થ g4f.space ગેટવે. અનામી ઍક્સેસ માટે g4f.dev/chat પરથી પ્રૂફ-ઓફ-વર્ક ક્રેડિટ અથવા g4f.dev/members.html પરથી સભ્ય API કી જરૂરી છે; મર્યાદાઓ બદલાય છે.",
+      "g4f-ollama": "Ollama માટેનું દૂરસ્થ g4f.space ગેટવે. અનામી ઍક્સેસ માટે g4f.dev/chat પરથી પ્રૂફ-ઓફ-વર્ક ક્રેડિટ અથવા g4f.dev/members.html પરથી સભ્ય API કી જરૂરી છે; મર્યાદાઓ બદલાય છે.",
+      "g4f-pollinations": "Pollinations માટેનું દૂરસ્થ g4f.space ગેટવે. અનામી ઍક્સેસ માટે g4f.dev/chat પરથી પ્રૂફ-ઓફ-વર્ક ક્રેડિટ અથવા g4f.dev/members.html પરથી સભ્ય API કી જરૂરી છે; મર્યાદાઓ બદલાય છે.",
       "mixedbread": "Mixedbread API વડે એમ્બેડિંગ્સ બનાવો.",
       "segmind": "Segmind ના હોસ્ટ કરેલા મોડલ્સ વડે છબીઓ અને વિડિઓઝ જનરેટ કરો.",
       "amazon-q": "Kiro જેવી જ AWS Builder ID અથવા આયાત કરેલ refresh-token ફ્લોનો ઉપયોગ કરે છે, પરંતુ Amazon Q કનેક્શન્સને અલગ રાખે છે.",
@@ -11314,7 +11314,9 @@
       "noPayload": "આ લોગ એન્ટ્રી માટે કોઈ પેલોડ ડેટા ઉપલબ્ધ નથી.",
       "correlationId": "સંબંધ ઓળખપત્ર",
       "correlationIdValue": "સંબંધિત ID: {id}",
-      "detailedPayloadInfo": "નવા વિનંતીઓ માટે ચાર-ચરણ ક્લાયન્ટ/પ્રદાતા પેલોડ દૃશ્ય મેળવવા માટે પ્રથમ વિગતવાર લોગિંગ સક્રિય કરો."
+      "detailedPayloadInfo": "નવા વિનંતીઓ માટે ચાર-ચરણ ક્લાયન્ટ/પ્રદાતા પેલોડ દૃશ્ય મેળવવા માટે પ્રથમ વિગતવાર લોગિંગ સક્રિય કરો.",
+      "copyAll": "Copy all",
+      "copiedAll": "Copied all"
     }
   },
   "proxyLogger": {
